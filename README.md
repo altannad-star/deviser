@@ -1,6 +1,6 @@
 # Deviser
 
-Clean-room viewer/exporter for Autodesk Inventor `.ipt` part files — built
+Clean-room viewer/exporter for Inventor `.ipt` part files — built
 entirely from observational format analysis (no decompilation).
 
 ## What it does
