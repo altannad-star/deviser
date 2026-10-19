@@ -1,0 +1,598 @@
+#!/usr/bin/env python3
+"""iptinfo — clean-room metadata extractor for Autodesk Inventor .ipt files.
+
+Works on Linux (tested on Bazzite KDE). Extracts: part title, author,
+material, Inventor build, locale, save timestamps, template provenance,
+and the embedded 512x512 PNG thumbnail.
+
+Derived exclusively from observational format analysis (container parsing,
+string scans, controlled diffs). No decompilation. Requires: python3-olefile.
+
+Usage:
+  iptinfo FILE.ipt [FILE2.ipt ...]     show info
+  iptinfo --json FILE.ipt              JSON output
+  iptinfo --thumbnail FILE.ipt out.png save thumbnail
+  iptinfo --inventory FILE.ipt         stream inventory
+"""
+import argparse
+import json
+import os
+import re
+import struct
+import sys
+import uuid
+
+try:
+    import olefile
+except ImportError:
+    sys.stderr.write(
+        "missing dependency: olefile\n"
+        "install with: pip install --user olefile   (or: sudo dnf install python3-olefile)\n"
+    )
+    sys.exit(2)
+
+PROLOGUE = bytes.fromhex("feff00000a000200")
+VT_I2, VT_I4, VT_R8, VT_LPWSTR, VT_BOOL, VT_FILETIME, VT_BLOB = 2, 3, 5, 0x1F, 0x0B, 0x40, 0x48
+
+# FMTID -> human role (from observational spec)
+FMTID_ROLES = {
+    "8cf58000-da66-4ae6-8ff0-7b58406fb049": "Inventor Document Summary Information",
+    "02657684-6ad0-49ec-bbd2-9cc4e9293e60": "_PostAdaInternalDateMigration",
+    "32853f0f-3444-11d1-9e93-0060b03c1ca6": "Design Tracking Properties",
+    "bb586990-af3e-11d3-95a9-00a0c9b6e37a": "_Private Model Information",
+    "d861fb30-3136-11d1-9e92-0060b03c1ca6": "Design Tracking Control",
+    "9929adb8-6407-413e-b3dc-cb9ad2f564b7": "Inventor User Defined Properties",
+    "3d38de39-0588-4c14-bb37-18f4d5dd31c7": "Inventor Summary Information",
+}
+
+PROP_NAMES_DSI = {
+    0x5: "Title (part name)",
+    0x29: "Author (last saved by)",
+    0x43: "Inventor build",
+    0x47: "Material library ref",
+    0x48: "Material appearance",
+    0x14: "Material name",
+    0x20: "Category",
+}
+
+
+def utf16_strings(data, min_chars=3):
+    return [s.decode("utf-16-le") for s in re.findall(rb'(?:[\x20-\x7e]\x00){%d,}' % min_chars, data)]
+
+
+def ascii_strings(data, min_chars=5):
+    return [s.decode("ascii") for s in re.findall(rb'[\x20-\x7e]{%d,}' % min_chars, data)]
+
+
+def filetime_to_iso(raw):
+    if raw == 0:
+        return None
+    import datetime
+    try:
+        return (datetime.datetime(1601, 1, 1) + datetime.timedelta(microseconds=raw // 10)).isoformat()
+    except Exception:
+        return None
+
+
+def decode_property_set(data):
+    """Decode a standard OLE property-set stream -> {fmtid: [(id, type, value)]}."""
+    if data[:8] != PROLOGUE:
+        return {}
+    numsec = struct.unpack_from("<I", data, 24)[0]
+    sections = {}
+    for s in range(numsec):
+        fmtid = str(uuid.UUID(bytes_le=data[28 + s * 20:44 + s * 20]))
+        sec_off = struct.unpack_from("<I", data, 44 + s * 20)[0]
+        if sec_off + 8 > len(data):
+            continue
+        cnt = struct.unpack_from("<I", data, sec_off + 4)[0]
+        props = []
+        for i in range(cnt):
+            pid, poff = struct.unpack_from("<II", data, sec_off + 8 + i * 8)
+            o = sec_off + poff
+            if o + 4 > len(data):
+                continue
+            typ = struct.unpack_from("<I", data, o)[0]
+            try:
+                if typ == VT_LPWSTR:
+                    slen = struct.unpack_from("<I", data, o + 4)[0]
+                    val = data[o + 8:o + 8 + slen * 2].decode("utf-16-le").rstrip("\x00")
+                elif typ == VT_R8:
+                    val = struct.unpack_from("<d", data, o + 4)[0]
+                elif typ == VT_I4:
+                    val = struct.unpack_from("<i", data, o + 4)[0]
+                elif typ == VT_I2:
+                    val = struct.unpack_from("<h", data, o + 4)[0]
+                elif typ == VT_BOOL:
+                    val = bool(struct.unpack_from("<H", data, o + 4)[0])
+                elif typ == VT_FILETIME:
+                    val = filetime_to_iso(struct.unpack_from("<Q", data, o + 4)[0])
+                elif typ == VT_BLOB:
+                    blen = struct.unpack_from("<I", data, o + 4)[0]
+                    val = data[o + 8:o + 8 + blen]
+                else:
+                    val = data[o + 4:o + 20]
+            except Exception:
+                val = data[o + 4:o + 20]
+            props.append((pid, typ, val))
+        sections[fmtid] = props
+    return sections
+
+
+
+# ---------------- RSe / parameter layer (session 4) ----------------
+
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+
+def _inflate_b_streams(ole):
+    """Decompress all RSeStorage/B* zstd payloads."""
+    try:
+        import zstandard
+    except ImportError:
+        return []
+    out = []
+    for entry in ole.listdir(streams=True):
+        path = "/".join(entry)
+        v = ole.openstream(entry).read()
+        if path.startswith("RSeStorage/B"):
+            i = v.find(ZSTD_MAGIC)
+            if i >= 0:
+                try:
+                    out.append(zstandard.ZstdDecompressor().decompress(v[i:], max_output_size=50_000_000))
+                except Exception:
+                    pass
+    return out
+
+
+def _scan_lp_strings(v):
+    """All length-prefixed UTF-16LE strings in a payload: [(offset, text)]."""
+    out = []
+    i = 0
+    while i < len(v) - 4:
+        n = struct.unpack_from("<I", v, i)[0]
+        if 1 <= n <= 60 and i + 4 + n * 2 <= len(v):
+            s = v[i + 4:i + 4 + n * 2]
+            if re.fullmatch(rb"(?:[\x20-\x7e]\x00){%d}" % n, s):
+                out.append((i, s.decode("utf-16-le")))
+                i += 4 + n * 2
+                continue
+        i += 2
+    return out
+
+
+def _extract_parameters_from_payload(v):
+    """User parameters {name: value} from an RSe payload.
+
+    Record grammar (spec session 9, ground-truth validated on params.ipt):
+      0b <flags:3B> <u32 namelen> <UTF16 name> <u32 0> <format...>
+    where format varies by parameter type:
+      - numeric (length/angle/etc): <u32 id1> <u32 id2> <f64 value>
+        (value in INTERNAL units: cm for length, radians for angle)
+      - text: <u32 textlen> <UTF16 text> <u32 id> ...
+    The <u32 0> separator and the id pair identify the unit/type.
+    Fallback: legacy name+display-string heuristic (older reading, kept
+    for unit-bearing display forms like '10 mm').
+    """
+    params = {}
+    # primary: binary record scan
+    i = 0
+    while i < len(v) - 16:
+        # record marker: bd 0b <flags:2B> <u32 namelen> (session-9 verified)
+        if v[i] == 0xbd and v[i+1] == 0x0b and v[i+2:i+4] == b"\x00\x00":
+            nlen = struct.unpack_from("<I", v, i+4)[0]
+            if 1 <= nlen <= 60 and i+8+nlen*2 <= len(v):
+                name_raw = v[i+8:i+8+nlen*2]
+                if re.fullmatch(rb"(?:[\x20-\x7e]\x00){%d}" % nlen, name_raw):
+                    name = name_raw.decode("utf-16-le")
+                    p = i + 8 + nlen*2
+                    sep = struct.unpack_from("<I", v, p)[0] if p+4 <= len(v) else None
+                    if sep == 0 and p+8 <= len(v):
+                        id1 = struct.unpack_from("<I", v, p+4)[0]
+                        id2 = struct.unpack_from("<I", v, p+8)[0] if p+12 <= len(v) else None
+                        # text first: id1 = textlen + printable UTF16 text
+                        if 0 < id1 <= 60 and p+8+id1*2 <= len(v):
+                            txt = v[p+8:p+8+id1*2]
+                            if re.fullmatch(rb"(?:[\x20-\x7e]\x00){%d}" % id1, txt):
+                                params[name] = txt.decode("utf-16-le")
+                                i = p + 8 + id1*2
+                                continue
+                        # numeric: id1,id2 = unit-id pair (id2 == id1+1 observed), then f64
+                        if 0 < id1 < 0x100 and id2 == id1 + 1 and p+20 <= len(v):
+                            dbl = struct.unpack_from("<d", v, p+12)[0]
+                            if abs(dbl) < 1e12 and dbl == dbl:
+                                params[name] = dbl
+                                i = p + 20
+                                continue
+        i += 1
+    if params:
+        return params
+    # fallback: legacy name + display-string pairs
+    strings = _scan_lp_strings(v)
+    legacy = {}
+    for idx in range(len(strings) - 1):
+        (i1, t1), (i2, t2) = strings[idx], strings[idx + 1]
+        if not re.match(r"^[A-Za-z][A-Za-z0-9_ ()\-]*$", t1):
+            continue
+        if re.match(r"^[\d.,\s]", t1):
+            continue
+        if not re.match(r"^[-+]?\d[\d.,\s]*([a-zA-Z\u00b0%]+)?$", t2):
+            continue
+        if i2 - i1 > 64:
+            continue
+        if re.match(r"^[\d.]+\s*(mm|Gauge|in|deg)", t1):
+            continue
+        legacy[t1] = t2
+    return legacy
+
+
+# ---------------- ASM entity stream reader (sessions 6-8) ----------------
+
+ASM_ENTITIES = ("body", "lump", "shell", "face", "loop", "plane", "surface",
+                "coedge", "edge", "vertex", "point", "straight", "curve",
+                "unknown", "ATTRIB_CUSTOM", "attrib", "Begin", "End",
+                "delta_state", "asmheader")
+
+
+def _find_asm_payload(ole):
+    """Return the decompressed ASM BinaryFile4 payload, or None."""
+    try:
+        import zstandard
+    except ImportError:
+        return None
+    for entry in ole.listdir(streams=True):
+        path = "/".join(entry)
+        if not path.startswith("RSeStorage/B"):
+            continue
+        v = ole.openstream(entry).read()
+        i = v.find(ZSTD_MAGIC)
+        if i < 0:
+            continue
+        try:
+            out = zstandard.ZstdDecompressor().decompress(v[i:], max_output_size=50_000_000)
+        except Exception:
+            continue
+        if b"ASM BinaryFile4" in out:
+            return out
+    return None
+
+
+def _read_asm_entities(payload):
+    """Parse the ASM binary entity stream -> list of entity dicts.
+
+    Token grammar per spec sessions 6-8:
+      11 <marker> <len> <name>  entity start
+      0c <i32> ref | 04 <i32> int | 06 <f64> dbl | 07 <len><str> string
+      0d/0e <len><name> subtype name | 0b flag
+      13/14 + UNPADDED f64 block (geometry coords, session-8 verified)
+    """
+    b = payload
+    i0 = b.find(b"ASM BinaryFile4")
+    if i0 < 0:
+        return []
+    b = b[i0:]
+    entities = []
+    pos = 0
+    current = None
+    def i32(p): return struct.unpack_from("<i", b, p)[0]
+    def f64(p): return struct.unpack_from("<d", b, p)[0]
+    while pos < len(b) - 4:
+        t = b[pos]
+        if t == 0x11:
+            ln = b[pos+2]
+            name = b[pos+3:pos+3+ln].decode("latin1", "replace")
+            current = {"type": name, "offset": pos, "refs": [], "ints": [],
+                       "dbls": [], "names": [], "flags": 0, "blocks": []}
+            entities.append(current)
+            pos += 3 + ln
+        elif t == 0x0c:
+            if current is not None: current["refs"].append(i32(pos+1))
+            pos += 5
+        elif t == 0x04:
+            if current is not None: current["ints"].append(i32(pos+1))
+            pos += 5
+        elif t == 0x06:
+            if current is not None: current["dbls"].append(f64(pos+1))
+            pos += 9
+        elif t == 0x07:
+            ln = b[pos+1]
+            if current is not None: current["names"].append(b[pos+2:pos+2+ln])
+            pos += 2 + ln
+        elif t in (0x0d, 0x0e):
+            ln = b[pos+1]
+            if current is not None: current["names"].append(b[pos+2:pos+2+ln])
+            pos += 2 + ln
+        elif t == 0x0b:
+            if current is not None: current["flags"] += 1
+            pos += 1
+        elif t in (0x13, 0x14):
+            # double block: tag + UNPADDED f64s until next known tag
+            # (session 8 byte-exact alignment: point=(1.0,0.0,0.0), plane=(0.5,0.5,0,0))
+            p = pos + 1
+            dbls = []
+            while p + 8 <= len(b) and b[p] not in (0x11, 0x0c, 0x04, 0x06, 0x07, 0x0d, 0x0e, 0x0b, 0x13, 0x14):
+                dbls.append(f64(p)); p += 8
+            if current is not None: current["blocks"].append((hex(t), dbls))
+            pos = p
+        else:
+            pos += 1  # tolerate unknown byte (history section has extra framing)
+    return entities
+
+
+class IptFile:
+    def __init__(self, path):
+        self.path = path
+        self.ole = olefile.OleFileIO(path)
+        self._streams = {}
+        for entry in self.ole.listdir(streams=True):
+            name = "/".join(entry)
+            self._streams[name] = self.ole.openstream(entry).read()
+        self._propsets = {}   # fmtid -> [(id,type,val)], merged across streams
+        self._thumb = None
+        for name, data in self._streams.items():
+            if data[:8] == PROLOGUE:
+                for fmtid, props in decode_property_set(data).items():
+                    self._propsets.setdefault(fmtid, []).extend(props)
+            if self._thumb is None and b"\x89PNG\r\n\x1a\n" in data[:1024]:
+                i = data.find(b"\x89PNG\r\n\x1a\n")
+                iend = data.rfind(b"IEND")
+                if iend > 0:
+                    self._thumb = data[i:iend + 8]
+
+    def close(self):
+        self.ole.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
+    def props(self, fmtid):
+        out = {}
+        for pid, _typ, val in self._propsets.get(fmtid, []):
+            out[pid] = val
+        return out
+
+    def design_tracking(self):
+        return self.props("32853f0f-3444-11d1-9e93-0060b03c1ca6")
+
+    def part_title(self):
+        v = self.design_tracking().get(0x5)
+        return v if isinstance(v, str) else None
+
+    def author(self):
+        v = self.design_tracking().get(0x29)
+        return v if isinstance(v, str) else None
+
+    def material(self):
+        dt = self.design_tracking()
+        info = {}
+        lib = dt.get(0x47)
+        if isinstance(lib, str):
+            parts = lib.split("\n")
+            info["library_ref"] = parts[0]
+            if len(parts) > 1:
+                info["material_id"] = parts[-1].lstrip("#")
+        if isinstance(dt.get(0x14), str):
+            info["material_name"] = dt[0x14]
+        if isinstance(dt.get(0x48), str):
+            info["appearance"] = dt[0x48]
+        if isinstance(dt.get(0x3d), float):
+            info["density_g_cm3"] = dt[0x3d]
+        return info
+
+    def inventor_build(self):
+        v = self.design_tracking().get(0x43)
+        return v if isinstance(v, str) else None
+
+    def active_color_style_xml(self):
+        for v in self.props("bb586990-af3e-11d3-95a9-00a0c9b6e37a").values():
+            if isinstance(v, str) and v.startswith("<PartActiveColorStyle>"):
+                return v
+        return None
+
+    def thumbnail(self):
+        return self._thumb
+
+    def ufrxdoc_records(self):
+        return utf16_strings(self._streams.get("UFRxDoc", b""))
+
+    def schemas(self):
+        out = {}
+        for s in self.ufrxdoc_records():
+            for key in ("File Schema", "Software Schema"):
+                if s.startswith(key + ":"):
+                    out[key] = s.split(":", 1)[1].strip()
+        return out
+
+    def template_provenance(self):
+        for s in self.ufrxdoc_records():
+            if s.startswith("Document ") and " was created" in s:
+                return s
+        return None
+
+    def rse_meta_version(self):
+        for v in self._streams.values():
+            m = re.search(rb"RSe Meta Stream Version (\d+)", v[:200])
+            if m:
+                return int(m.group(1))
+        return None
+
+    def rse_timestamps(self):
+        ts = set()
+        for name, v in self._streams.items():
+            if name.startswith("RSeStorage/"):
+                for s in ascii_strings(v, 8):
+                    if re.match(r"^\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}$", s):
+                        ts.add(s)
+        return sorted(ts)
+
+    def locale(self):
+        data = self._streams.get("RSeStorage/RSeEmbeddings/Contents", b"")
+        for s in utf16_strings(data):
+            if re.match(r"^[A-Z][a-z]+ \([A-Z][a-z]+\)$", s):
+                return s
+        return None
+
+    def stream_inventory(self):
+        rows = []
+        for entry in self.ole.listdir(streams=True, storages=True):
+            path = "/".join(entry)
+            try:
+                size = self.ole.get_size(entry)
+            except Exception:
+                size = None
+            rows.append((path, size))
+        return rows
+
+    def all_properties(self):
+        out = {}
+        for fmtid, props in self._propsets.items():
+            role = FMTID_ROLES.get(fmtid, fmtid)
+            section = {}
+            for pid, typ, val in props:
+                label = PROP_NAMES_DSI.get(pid) or ("prop_%s" % hex(pid))
+                if isinstance(val, bytes):
+                    val = val.hex()
+                if isinstance(val, str) and len(val) > 300:
+                    val = val[:300] + "..."
+                section[label] = val
+            out[role] = section
+        return out
+
+
+    def parameters(self):
+        """User parameters {name: equation_text} from the RSe B-rep payload.
+
+        Requires the 'zstandard' module. Returns {} when absent or when the
+        file has no user parameters.
+        """
+        if not hasattr(self, "_params"):
+            self._params = {}
+            for v in _inflate_b_streams(self.ole):
+                self._params.update(_extract_parameters_from_payload(v))
+        return self._params
+
+
+    def asm_entities(self):
+        """ASM (ACIS-family) entities from the B-rep payload.
+
+        Returns list of dicts (type, refs, ints, dbls, blocks...).
+        Requires 'zstandard'. Empty list if absent or not an Inventor part
+        with ASM data.
+        """
+        if not hasattr(self, "_asm"):
+            payload = _find_asm_payload(self.ole)
+            self._asm = _read_asm_entities(payload) if payload else []
+        return self._asm
+
+    def asm_topology_summary(self):
+        """Counts of ASM entity types + first geometry block per entity."""
+        from collections import Counter
+        c = Counter(e["type"] for e in self.asm_entities())
+        return dict(c)
+
+    def asm_sketch_vertices(self):
+        """Decoded point-entity coordinates (the explicit base topology).
+
+        Uses the first 0x13-block with >= 3 doubles per point entity.
+        """
+        out = []
+        for e in self.asm_entities():
+            if e["type"] != "point":
+                continue
+            for tag, dbls in e["blocks"]:
+                if tag == "0x13" and len(dbls) >= 3:
+                    out.append(dbls[:3])
+                    break
+        return out
+
+    def summary(self):
+        return {
+            "file": os.path.basename(self.path),
+            "part_title": self.part_title(),
+            "parameters": self.parameters(),
+            "asm_topology": self.asm_topology_summary() or None,
+            "asm_vertices": self.asm_sketch_vertices() or None,
+            "author": self.author(),
+            "inventor_build": self.inventor_build(),
+            "material": self.material(),
+            "schemas": self.schemas(),
+            "template_provenance": self.template_provenance(),
+            "locale": self.locale(),
+            "rse_meta_version": self.rse_meta_version(),
+            "rse_save_timestamps": self.rse_timestamps(),
+            "thumbnail_png": len(self._thumb) if self._thumb else None,
+            "properties": self.all_properties(),
+        }
+
+
+def print_human(s):
+    print(f"=== {s['file']} ===")
+    print(f"  Title:            {s['part_title']}")
+    if s.get('parameters'):
+        for name, val in s['parameters'].items():
+            print(f"  Parameter:        {name} = {val}")
+    print(f"  Author:           {s['author']}")
+    print(f"  Inventor build:   {s['inventor_build']}")
+    m = s["material"]
+    if m:
+        print(f"  Material:         {m.get('material_name')} / {m.get('material_id')} "
+              f"(density {m.get('density_g_cm3')} g/cm^3, appearance {m.get('appearance')})")
+    print(f"  Locale:           {s['locale']}")
+    print(f"  Schemas:          {s['schemas']}")
+    print(f"  RSe version:      {s['rse_meta_version']}  saves: {s['rse_save_timestamps']}")
+    if s["thumbnail_png"]:
+        print(f"  Thumbnail:        yes ({s['thumbnail_png']} bytes PNG)")
+
+
+def main():
+    p = argparse.ArgumentParser(description="Extract metadata from Autodesk Inventor .ipt files")
+    p.add_argument("files", nargs="+", help=".ipt file(s)")
+    p.add_argument("--json", action="store_true", help="JSON output")
+    p.add_argument("--all", action="store_true", help="include full property dump (with --json)")
+    p.add_argument("--thumbnail", metavar="PREFIX", help="save thumbnail(s) as PREFIX.png")
+    p.add_argument("--inventory", action="store_true", help="dump OLE stream inventory")
+    args = p.parse_args()
+
+    rc = 0
+    for path in args.files:
+        try:
+            with IptFile(path) as ipt:
+                if args.inventory:
+                    for stream, size in ipt.stream_inventory():
+                        print(f"{size if size is not None else '-':>10}  {stream}")
+                    continue
+                s = ipt.summary()
+                if not args.all:
+                    s["properties"] = "(use --all to include)"
+                if args.json:
+                    print(json.dumps(s, indent=2, default=str))
+                else:
+                    print_human(s)
+                    if args.all:
+                        for role, section in s["properties"].items():
+                            print(f"  [{role}]")
+                            for k, v in section.items():
+                                print(f"    {k}: {v}")
+                if args.thumbnail:
+                    png = ipt.thumbnail()
+                    if png:
+                        base = args.thumbnail
+                        if len(args.files) > 1:
+                            base = f"{args.thumbnail}_{os.path.splitext(os.path.basename(path))[0]}"
+                        fn = f"{base}.png"
+                        with open(fn, "wb") as f:
+                            f.write(png)
+                        print(f"  -> thumbnail saved: {fn}")
+                    else:
+                        print("  -> no thumbnail found", file=sys.stderr)
+                        rc = 1
+        except Exception as e:
+            print(f"ERROR {path}: {e}", file=sys.stderr)
+            rc = 1
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

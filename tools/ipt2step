@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""ipt2step — clean-room STEP (AP214) exporter for Inventor .ipt files.
+
+Writes EXACT boundary-representation solids (no tessellation):
+  - polygon sketch + extrude depth  -> analytic prism (planar faces, LINE edges)
+  - circle sketch + extrude depth    -> analytic cylinder (CYLINDRICAL_SURFACE,
+                                        CIRCLE edges, seam handling)
+Output units: mm. Opens in FreeCAD as an editable solid.
+
+Clean-room: derived exclusively from observational format analysis.
+"""
+import math
+import sys
+import os
+import importlib.util
+import importlib.machinery
+
+
+def _load(name, target):
+    here = os.path.dirname(os.path.abspath(__file__))
+    for p in (os.path.join(here, name),
+              os.path.join(getattr(sys, "_MEIPASS", here), name)):
+        if os.path.exists(p):
+            loader = importlib.machinery.SourceFileLoader(target, p)
+            spec = importlib.util.spec_from_loader(target, loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            return mod
+    raise RuntimeError(f"module {name} not found")
+
+
+iptinfo = _load("iptinfo", "iptinfo")
+ipt2obj_mod = _load("ipt2obj", "ipt2obj_mod")
+
+
+class StepWriter:
+    """Minimal ISO-10303-21 (AP214) writer for analytic solids."""
+
+    def __init__(self):
+        self.entities = []          # list of (id, text)
+        self.next_id = 1
+
+    def add(self, text):
+        i = self.next_id
+        self.next_id += 1
+        self.entities.append((i, text))
+        return i
+
+    def point(self, xyz):
+        x, y, z = xyz
+        c = self.add(f"CARTESIAN_POINT('',({x!r},{y!r},{z!r}))")
+        d = self.add(f"DIRECTION('',({0.0!r},{0.0!r},{1.0!r}))")
+        return self.add(f"POINT('Origin',{c},{d})")
+
+    def vertex(self, xyz):
+        p = self.point(xyz)
+        return self.add(f"VERTEX_POINT('',{p})")
+
+    def direction(self, xyz):
+        x, y, z = xyz
+        return self.add(f"DIRECTION('',({x!r},{y!r},{z!r}))")
+
+    def vector(self, xyz, scale=1.0):
+        d = self.direction(xyz)
+        return self.add(f"VECTOR('',{d},{scale!r})")
+
+    def axis2_3d(self, loc, axis, ref):
+        p = self.point(loc)
+        a = self.direction(axis)
+        r = self.direction(ref)
+        return self.add(f"AXIS2_PLACEMENT_3D('',{p},{a},{r})")
+
+    def line(self, p0, dirv):
+        a = self.axis2_3d(p0, dirv, (0.0, 0.0, 1.0) if abs(dirv[2]) < 0.9 else (1.0, 0.0, 0.0))
+        v = self.vector(dirv, 1.0)
+        return self.add(f"LINE('',{a},{v})")
+
+    def circle3d(self, center, normal, radius, ref):
+        a = self.axis2_3d(center, normal, ref)
+        return self.add(f"CIRCLE('',{a},{radius!r})")
+
+    def plane(self, center, normal, ref):
+        a = self.axis2_3d(center, normal, ref)
+        return self.add(f"PLANE('',{a})")
+
+    def cylindrical_surface(self, center, normal, radius, ref):
+        a = self.axis2_3d(center, normal, ref)
+        return self.add(f"CYLINDRICAL_SURFACE('',{a},{radius!r})")
+
+    def edge_curve(self, v1, v2, curve, same_sense=True):
+        return self.add(
+            f"EDGE_CURVE('',{v1},{v2},{curve},{str(same_sense).upper()})")
+
+    def oriented_edge(self, e, forward=True):
+        return self.add(f"ORIENTED_EDGE('',*,*,{e},{str(forward).upper()})")
+
+    def edge_loop(self, oedges):
+        return self.add("EDGE_LOOP('',(" + ",".join(str(o) for o in oedges) + ",))")
+
+    def face_outer_bound(self, loop, sense=True):
+        return self.add(f"FACE_OUTER_BOUND('',{loop},{str(sense).upper()})")
+
+    def advanced_face(self, bound, surface, same_sense=True):
+        return self.add(
+            f"ADVANCED_FACE('',({bound},),{surface},{str(same_sense).upper()})")
+
+    def closed_shell(self, faces):
+        return self.add("CLOSED_SHELL('',(" + ",".join(str(f) for f in faces) + ",))")
+
+    def manifold_solid_brep(self, shell):
+        return self.add(f"MANIFOLD_SOLID_BREP('',{shell})")
+
+    def write(self, brep_id, name="Deviser part"):
+        # product structure
+        prod = self.add(f"PRODUCT('Deviser part','{name}','',{self._cls('product')})")
+        pf = self.add("PRODUCT_DEFINITION_FORMATION('',''," + str(prod) + ")")
+        pc = self.add("PRODUCT_CATEGORY('','part')")
+        self.add(f"PRODUCT_RELATED_PRODUCT_CATEGORY('',{pc},{pf})")
+        # shape representation
+        items = self.add("SHAPE_REPRESENTATION('',(#0),#LEN)")
+        raise NotImplementedError  # replaced below
+
+
+def fmt(x):
+    """STEP real formatting (normalize negative zero)."""
+    v = float(x)
+    if v == 0.0:
+        v = 0.0
+    return repr(v)
+
+
+def build_step(ipt):
+    """Construct AP214 STEP text for the part's base solid. Units mm."""
+    verts, lines, circles = ipt2obj_mod.extract_geometry(ipt)
+    radius = ipt2obj_mod.ellipse_radius(ipt)
+    depth = ipt2obj_mod.extrude_depth(ipt)
+    S = 10.0  # cm -> mm
+
+    if depth <= 0:
+        raise SystemExit("no extrusion depth found — nothing solid to export")
+
+    ents = {}       # id -> text
+    next_id = [1]
+
+    def add(text):
+        i = next_id[0]
+        next_id[0] += 1
+        ents[i] = text
+        return i
+
+    def point(x, y, z):
+        c = add(f"CARTESIAN_POINT('',({fmt(x)},{fmt(y)},{fmt(z)}))")
+        return c
+
+    def dirv(x, y, z):
+        return add(f"DIRECTION('',({fmt(x)},{fmt(y)},{fmt(z)}))")
+
+    def axis2(loc, axis, ref):
+        p = point(*loc)
+        a = dirv(*axis)
+        r = dirv(*ref)
+        return add(f"AXIS2_PLACEMENT_3D('',#{p},#{a},#{r})")
+
+    def vertex(x, y, z):
+        p = point(x, y, z)
+        return add(f"VERTEX_POINT('',#{p})")
+
+    def line_edge(v1, v2, p0, d, length):
+        a = axis2(p0, d, (0.0, 0.0, 1.0) if abs(d[2]) < 0.9 else (1.0, 0.0, 0.0))
+        v = add(f"VECTOR('',#{dirv(*d)},{fmt(length)})")
+        ln = add(f"LINE('',#{a},#{v})")
+        return add(f"EDGE_CURVE('',#{v1},#{v2},#{ln},.T.)")
+
+    def circle_edge(v1, v2, center, normal, radius, ref):
+        a = axis2(center, normal, ref)
+        c = add(f"CIRCLE('',#{a},{fmt(radius)})")
+        return add(f"EDGE_CURVE('',#{v1},#{v2},#{c},.T.)")
+
+    def oedge(e, fwd=True):
+        flag = '.T.' if fwd else '.F.'
+        return add(f"ORIENTED_EDGE('',*,*,#{e},{flag})")
+
+    def loop(oes):
+        return add("EDGE_LOOP('',(" + ",".join(f"#{o}" for o in oes) + "))")
+
+    def outer_bound(lp):
+        return add(f"FACE_OUTER_BOUND('',#{lp},.T.)")
+
+    def plane_surf(center, normal, ref):
+        a = axis2(center, normal, ref)
+        return add(f"PLANE('',#{a})")
+
+    def cyl_surf(center, normal, radius, ref):
+        a = axis2(center, normal, ref)
+        return add(f"CYLINDRICAL_SURFACE('',#{a},{fmt(radius)})")
+
+    def face(bound, surf, sense=".T."):
+        return add(f"ADVANCED_FACE('',(#{bound}),#{surf},{sense})")
+
+    faces = []
+
+    # ---------------- PRISM (polygon sketch) ----------------
+    if len(verts) >= 3:
+        n = len(verts)
+        bot = [vertex(v[0]*S, v[1]*S, v[2]*S) for v in verts]
+        top = [vertex(v[0]*S, v[1]*S, (v[2]+depth)*S) for v in verts]
+        # side edges
+        side = []
+        for i in range(n):
+            j = (i + 1) % n
+            p0 = (verts[i][0]*S, verts[i][1]*S, verts[i][2]*S)
+            p1 = (verts[j][0]*S, verts[j][1]*S, verts[j][2]*S)
+            dx, dy, dz = p1[0]-p0[0], p1[1]-p0[1], p1[2]-p0[2]
+            ln = math.sqrt(dx*dx+dy*dy+dz*dz)
+            side.append(line_edge(bot[i], bot[j], p0, (dx/ln, dy/ln, dz/ln), ln))
+        # vertical edges
+        vert_e = []
+        for i in range(n):
+            p0 = (verts[i][0]*S, verts[i][1]*S, verts[i][2]*S)
+            vert_e.append(line_edge(bot[i], top[i], p0, (0.0, 0.0, 1.0), depth*S))
+        # top edges (top[i] -> top[j], same direction as bottom side edges)
+        top_e = []
+        for i in range(n):
+            j = (i + 1) % n
+            p0 = (verts[i][0]*S, verts[i][1]*S, (verts[i][2]+depth)*S)
+            p1 = (verts[j][0]*S, verts[j][1]*S, (verts[j][2]+depth)*S)
+            dx, dy = p1[0]-p0[0], p1[1]-p0[1]
+            ln = math.hypot(dx, dy) or 1.0
+            top_e.append(line_edge(top[i], top[j], p0, (dx/ln, dy/ln, 0.0), ln))
+        # side faces: bot[i]->bot[j] up to top[j] across to top[i] down to bot[i]
+        for i in range(n):
+            j = (i + 1) % n
+            oes = [oedge(side[i]), oedge(vert_e[j]), oedge(top_e[i], False), oedge(vert_e[i], False)]
+            lp = loop(oes)
+            b = outer_bound(lp)
+            mid = ((verts[i][0]+verts[j][0])/2*S, (verts[i][1]+verts[j][1])/2*S, verts[i][2]*S)
+            ex = verts[j][0]-verts[i][0]
+            ey = verts[j][1]-verts[i][1]
+            nx = ey * (depth*S)
+            ny = -(ex * (depth*S))
+            nl = math.sqrt(nx*nx+ny*ny) or 1.0
+            s = plane_surf(mid, (nx/nl, ny/nl, 0.0), (0.0, 0.0, 1.0))
+            faces.append(face(b, s))
+        # bottom cap (reversed sense so normal points -Z)
+        oes = [oedge(side[i], False) for i in reversed(range(n))]
+        b = outer_bound(loop(oes))
+        s = plane_surf((verts[0][0]*S, verts[0][1]*S, verts[0][2]*S), (0.0, 0.0, -1.0), (1.0, 0.0, 0.0))
+        faces.append(face(b, s, ".F."))
+        # top cap
+        top_e = []
+        for i in range(n):
+            j = (i + 1) % n
+            p0 = (verts[i][0]*S, verts[i][1]*S, (verts[i][2]+depth)*S)
+            p1 = (verts[j][0]*S, verts[j][1]*S, (verts[j][2]+depth)*S)
+            dx, dy = p1[0]-p0[0], p1[1]-p0[1]
+            ln = math.hypot(dx, dy) or 1.0
+            top_e.append(line_edge(top[i], top[j], p0, (dx/ln, dy/ln, 0.0), ln))
+        oes = [oedge(top_e[i]) for i in range(n)]
+        b = outer_bound(loop(oes))
+        s = plane_surf((verts[0][0]*S, verts[0][1]*S, (verts[0][2]+depth)*S), (0.0, 0.0, 1.0), (1.0, 0.0, 0.0))
+        faces.append(face(b, s))
+
+    # ---------------- CYLINDER ----------------
+    elif circles and radius:
+        center, nvec, _ = circles[0]
+        nl = math.sqrt(nvec[0]**2 + nvec[1]**2 + nvec[2]**2) or 1.0
+        nrm = (nvec[0]/nl, nvec[1]/nl, nvec[2]/nl)
+        c = (center[0]*S, center[1]*S, center[2]*S)
+        R = radius * S
+        # local basis: u,v perpendicular to normal
+        if abs(nrm[2]) < 0.9:
+            u = (1.0, 0.0, 0.0)
+        else:
+            u = (0.0, 1.0, 0.0)
+        dot = u[0]*nrm[0] + u[1]*nrm[1] + u[2]*nrm[2]
+        u = (u[0]-dot*nrm[0], u[1]-dot*nrm[1], u[2]-dot*nrm[2])
+        ul = math.sqrt(u[0]**2+u[1]**2+u[2]**2) or 1.0
+        u = (u[0]/ul, u[1]/ul, u[2]/ul)
+        v = (nrm[1]*u[2]-nrm[2]*u[1], nrm[2]*u[0]-nrm[0]*u[2], nrm[0]*u[1]-nrm[1]*u[0])
+        p0 = (c[0], c[1], c[2])                       # bottom center
+        p1 = (c[0]+nrm[0]*depth*S, c[1]+nrm[1]*depth*S, c[2]+nrm[2]*depth*S)
+        seam_b = (c[0]+u[0]*R, c[1]+u[1]*R, c[2]+u[2]*R)
+        seam_t = (seam_b[0]+nrm[0]*depth*S, seam_b[1]+nrm[1]*depth*S, seam_b[2]+nrm[2]*depth*S)
+        vb = vertex(*seam_b)
+        vt = vertex(*seam_t)
+        # bottom full circle (single edge, vertex->itself)
+        e_bot = circle_edge(vb, vb, p0, nrm, R, u)
+        # top full circle
+        e_top = circle_edge(vt, vt, p1, nrm, R, u)
+        # seam line (up the side) — used twice with orientation
+        d = nrm
+        a = axis2(seam_b, d, u)
+        vv = add(f"VECTOR('',#{dirv(*d)},{fmt(depth*S)})")
+        ln = add(f"LINE('',#{a},#{vv})")
+        e_seam = add(f"EDGE_CURVE('',{vb},{vt},#{ln},.T.)")
+        # bottom cap: plane, bound = circle edge (reversed)
+        b1 = outer_bound(loop([oedge(e_bot, False)]))
+        s1 = plane_surf(p0, (-nrm[0], -nrm[1], -nrm[2]), u)
+        faces.append(face(b1, s1, ".F."))
+        # top cap
+        b2 = outer_bound(loop([oedge(e_top, True)]))
+        s2 = plane_surf(p1, nrm, u)
+        faces.append(face(b2, s2))
+        # lateral: cylindrical surface, bound = seam up + top circle + seam down + bottom circle
+        oes = [oedge(e_seam, True), oedge(e_top, True), oedge(e_seam, False), oedge(e_bot, True)]
+        b3 = outer_bound(loop(oes))
+        s3 = cyl_surf(p0, nrm, R, u)
+        faces.append(face(b3, s3))
+    else:
+        raise SystemExit("no exportable sketch geometry found")
+
+    shell = add("CLOSED_SHELL('',(" + ",".join(f"#{f}" for f in faces) + "))")
+    brep = add(f"MANIFOLD_SOLID_BREP('',#{shell})")
+
+    # ---- units & contexts FIRST (OCC-compatible schema) ----
+    u1 = add("( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.) )")
+    u2 = add("( NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.RADIAN.) )")
+    u3 = add("( NAMED_UNIT(*) SI_UNIT($,.STERADIAN.) SOLID_ANGLE_UNIT() )")
+    uncert = add(f"UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(1.E-07),#{u1},'distance_accuracy','closure')")
+    geom_ctx = add(f"( GEOMETRIC_REPRESENTATION_CONTEXT(3) GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#{uncert})) GLOBAL_UNIT_ASSIGNED_CONTEXT((#{u1},#{u2},#{u3})) REPRESENTATION_CONTEXT('Context #1','3D Context with UNIT and UNCERTAINTY') )")
+    appl_ctx = add("APPLICATION_CONTEXT('core data for automotive mechanical design processes')")
+    app = add(f"APPLICATION_PROTOCOL_DEFINITION('international standard','automotive_design',2000,#{appl_ctx})")
+    prod_ctx = add(f"PRODUCT_CONTEXT('',#{appl_ctx},'mechanical')")
+    prod = add(f"PRODUCT('Deviser','Deviser exported part','',#{prod_ctx})")
+    pdef_form = add(f"PRODUCT_DEFINITION_FORMATION('','',#{prod})")
+    pd = add(f"PRODUCT_DEFINITION('design','Deviser export',#{pdef_form},#{prod_ctx})")
+    prod_def_shape = add(f"PRODUCT_DEFINITION_SHAPE('','',#{pd})")
+    shape_rep = add(f"ADVANCED_BREP_SHAPE_REPRESENTATION('',(#{brep}),#{geom_ctx})")
+    sdr = add(f"SHAPE_DEFINITION_REPRESENTATION(#{prod_def_shape},#{shape_rep})")
+    pcat = add(f"PRODUCT_RELATED_PRODUCT_CATEGORY('part','',#{pd})")
+
+    # header + data
+    out = []
+    out.append("ISO-10303-21;")
+    out.append("HEADER;")
+    out.append("FILE_DESCRIPTION(('Deviser clean-room Inventor export'),'2;1');")
+    out.append("FILE_NAME('part.step','Deviser','Deviser clean-room RE','Deviser','ipt2step','','');")
+    out.append("FILE_SCHEMA(('AUTOMOTIVE_DESIGN { 1 0 10303 214 3 1 1 }'));")
+    out.append("ENDSEC;")
+    out.append("DATA;")
+    for i in sorted(ents):
+        out.append(f"#{i}={ents[i]};")
+    out.append("ENDSEC;")
+    out.append("END-ISO-10303-21;")
+    return "\n".join(out) + "\n"
+
+
+def auto_fillet_radius(ipt):
+    """Detect a fillet radius stored as a dN (N>=4) model parameter (cm)."""
+    try:
+        params = ipt.parameters()
+    except Exception:
+        return 0.0
+    cands = {k: v for k, v in params.items()
+             if isinstance(v, float) and k.startswith("d")
+             and k[1:].isdigit() and int(k[1:]) >= 4}
+    if not cands:
+        return 0.0
+    k = sorted(cands, key=lambda x: int(x[1:]))[0]
+    return cands[k] * 10.0  # cm -> mm
+
+
+def export_step_occ(ipt, out_path, fillet_r_mm=0.0):
+    """Exact solid via OpenCascade (preferred; needs 'cadquery')."""
+    import cadquery as cq
+    verts, lines, circles = ipt2obj_mod.extract_geometry(ipt)
+    radius = ipt2obj_mod.ellipse_radius(ipt)
+    depth = ipt2obj_mod.extrude_depth(ipt)
+    S = 10.0
+    if len(verts) >= 3 and depth > 0:
+        wp = cq.Workplane("XY").polyline(
+            [(v[0]*S, v[1]*S) for v in verts]).close().extrude(depth*S)
+        if not fillet_r_mm:
+            fillet_r_mm = auto_fillet_radius(ipt)
+        if fillet_r_mm:
+            wp = wp.edges("|Z").fillet(fillet_r_mm)
+    elif circles and radius:
+        c = circles[0]
+        wp = cq.Workplane("XY").center(c[0][0]*S, c[0][1]*S).circle(
+            radius*S).extrude(depth*S)
+    else:
+        raise SystemExit("no exportable solid geometry found")
+    cq.exporters.export(wp, out_path)
+    return wp.val().Volume()
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(description="Export Inventor .ipt base solid to STEP (AP214, mm)")
+    ap.add_argument("file")
+    ap.add_argument("-o", "--output", help="output .step/.stp path")
+    ap.add_argument("--fillet", type=float, default=0.0, metavar="R_MM",
+                    help="apply fillet radius R (mm) to vertical edges "
+                         "(feature replay experiment)")
+    args = ap.parse_args()
+    out_path = args.output or (args.file.rsplit(".", 1)[0] + ".step")
+    with iptinfo.IptFile(args.file) as ipt:
+        try:
+            vol = export_step_occ(ipt, out_path, args.fillet)
+            print(f"wrote {out_path} (exact solid via OpenCascade, volume {vol:.2f} mm^3)")
+        except ImportError:
+            text = build_step(ipt)
+            with open(out_path, "w") as f:
+                f.write(text)
+            print(f"wrote {out_path} ({len(text)} bytes, hand-written AP214; "
+                  f"pip install cadquery for OpenCascade-grade output)")
+
+
+if __name__ == "__main__":
+    main()

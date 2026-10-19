@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""ipt2obj — clean-room geometry exporter: Inventor .ipt → Wavefront OBJ.
+
+Reads the ASM (ACIS-family) entity stream that iptinfo decodes and
+reconstructs the explicit sketch geometry as a 3D mesh:
+
+  - 'straight' edges + 'point' entities  → line segments / vertices
+  - 'ellipse' entities                   → circles (tessellated)
+  - extrusion depth (model dimension d1)  → prism generation
+
+Current scope (honest): sketch face + extrusion prisms. Curved faces and
+history features like fillets are located but not replayed — the export
+covers the base solid. Output units: cm (ACIS internal), converted to mm.
+
+Usage:
+  ipt2obj FILE.ipt [-o out.obj] [--lines-only]
+"""
+import argparse
+import math
+import struct
+import sys
+
+sys.path.insert(0, "/dev/null")  # no-op; same-dir import below
+
+import importlib.util, importlib.machinery, os
+_here = os.path.dirname(os.path.abspath(__file__))
+_loader = importlib.machinery.SourceFileLoader(
+    "iptinfo", os.path.join(_here, "iptinfo"))
+_spec = importlib.util.spec_from_loader("iptinfo", _loader)
+iptinfo = importlib.util.module_from_spec(_spec)
+_loader.exec_module(iptinfo)
+IptFile = iptinfo.IptFile
+
+
+def tessellate_circle(center, normal, radius, segments=48):
+    """Circle → list of (x,y,z) points on it."""
+    # build orthonormal basis perpendicular to normal
+    n = normal
+    if abs(n[0]) < 0.9:
+        u = (1.0, 0.0, 0.0)
+    else:
+        u = (0.0, 1.0, 0.0)
+    # u = u - (u.n)n ; v = n x u
+    dot = u[0]*n[0] + u[1]*n[1] + u[2]*n[2]
+    u = (u[0]-dot*n[0], u[1]-dot*n[1], u[2]-dot*n[2])
+    ulen = math.sqrt(u[0]**2+u[1]**2+u[2]**2) or 1.0
+    u = (u[0]/ulen, u[1]/ulen, u[2]/ulen)
+    v = (n[1]*u[2]-n[2]*u[1], n[2]*u[0]-n[0]*u[2], n[0]*u[1]-n[1]*u[0])
+    pts = []
+    for i in range(segments):
+        a = 2*math.pi*i/segments
+        w = (math.cos(a), math.sin(a))
+        pts.append((center[0] + radius*(w[0]*u[0] + w[1]*v[0]),
+                    center[1] + radius*(w[0]*u[1] + w[1]*v[1]),
+                    center[2] + radius*(w[0]*u[2] + w[1]*v[2])))
+    return pts
+
+
+def extract_geometry(ipt):
+    """Pull sketch entities from the ASM stream."""
+    verts = ipt.asm_sketch_vertices()          # list of [x,y,z]
+    entities = ipt.asm_entities()
+    lines = []   # (root, direction) per straight
+    circles = [] # (center, normal, radius)
+    for e in entities:
+        if e["type"] == "straight":
+            root = e["blocks"][0][1][:3] if e["blocks"] else None
+            # direction in second block (0x14) if present
+            if len(e["blocks"]) >= 2:
+                direction = e["blocks"][1][1][:3]
+                lines.append((tuple(root), tuple(direction)))
+        elif e["type"] == "ellipse":
+            blocks = e["blocks"]
+            if len(blocks) >= 2:
+                center = tuple(blocks[0][1][:3])
+                # normal is first 0x14 block, radius = magnitude of major vector
+                nvec = tuple(blocks[1][1][:3])
+                circles.append((center, nvec, None))
+    return verts, lines, circles
+
+
+def ellipse_radius(ipt):
+    """Get the circle radius from model params (d0 = diameter in cm)."""
+    p = ipt.parameters()
+    if "d0" in p and isinstance(p["d0"], float):
+        return p["d0"] / 2.0
+    return None
+
+
+def extrude_depth(ipt):
+    """Extrusion depth from model dims (d1 in cm), else 0."""
+    p = ipt.parameters()
+    if "d1" in p and isinstance(p["d1"], float):
+        return p["d1"]
+    return 0.0
+
+
+def build_obj(verts, lines, circles, radius, depth, scale=10.0):
+    """Build OBJ text. scale: cm → mm."""
+    out = []
+    out.append("# Deviser ipt2obj — clean-room Inventor geometry export")
+    out.append("# units: mm (converted from ACIS cm)")
+    vlist = []
+    faces = []
+
+    def vid(p3):
+        vlist.append((p3[0]*scale, p3[1]*scale, p3[2]*scale))
+        return len(vlist)
+
+    if verts and len(verts) >= 3 and depth > 0:
+        # prism: bottom face verts, top face verts (extrude along Z)
+        bot = [vid(v) for v in verts]
+        top = [vid((v[0], v[1], v[2]+depth)) for v in verts]
+        n = len(verts)
+        # side quads
+        for i in range(n):
+            j = (i+1) % n
+            faces.append((bot[i], bot[j], top[j], top[i]))
+        # caps (fan triangulation)
+        for i in range(1, n-1):
+            faces.append((bot[0], bot[i], bot[i+1]))
+            faces.append((top[0], top[i+1], top[i]))
+    elif verts and len(verts) >= 2:
+        # sketch polygon only (no depth): emit as line loop
+        ids = [vid(v) for v in verts]
+        for i in range(len(ids)):
+            out.append(f"l {ids[i]} {ids[(i+1) % len(ids)]}")
+
+    if circles and radius:
+        center, nvec, _ = circles[0]
+        nl = math.sqrt(nvec[0]**2 + nvec[1]**2 + nvec[2]**2) or 1.0
+        normal = (nvec[0]/nl, nvec[1]/nl, nvec[2]/nl)
+        if depth > 0:
+            # cylinder: bottom ring, top ring, side quads
+            botr = [vid(p) for p in tessellate_circle(center, normal, radius)]
+            topr = [vid((p[0]+normal[0]*depth, p[1]+normal[1]*depth,
+                         p[2]+normal[2]*depth))
+                    for p in tessellate_circle(center, normal, radius)]
+            m = len(botr)
+            for i in range(m):
+                j = (i+1) % m
+                faces.append((botr[i], botr[j], topr[j], topr[i]))
+        else:
+            ring = [vid(p) for p in tessellate_circle(center, normal, radius)]
+            for i in range(len(ring)):
+                out.append(f"l {ring[i]} {ring[(i+1) % len(ring)]}")
+
+    for v in vlist:
+        out.append(f"v {v[0]:.4f} {v[1]:.4f} {v[2]:.4f}")
+    for f in faces:
+        out.append("f " + " ".join(str(i) for i in f))
+    # OBJ wants vertices before faces; rebuild in right order
+    header = [l for l in out if l.startswith("#")]
+    vl = [l for l in out if l.startswith("v ")]
+    fl = [l for l in out if l.startswith("f ")]
+    ll = [l for l in out if l.startswith("l ")]
+    return "\n".join(header + vl + ll + fl) + "\n"
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Export Inventor .ipt sketch/extrude geometry to OBJ")
+    ap.add_argument("file")
+    ap.add_argument("-o", "--output", help="output .obj path (default: <input>.obj)")
+    args = ap.parse_args()
+
+    out_path = args.output or (args.file.rsplit(".", 1)[0] + ".obj")
+    with IptFile(args.file) as ipt:
+        verts, lines, circles = extract_geometry(ipt)
+        radius = ellipse_radius(ipt)
+        depth = extrude_depth(ipt)
+        obj = build_obj(verts, lines, circles, radius, depth)
+    with open(out_path, "w") as f:
+        f.write(obj)
+    n_v = obj.count("\nv ") + obj.count("\n# ")  # crude
+    print(f"wrote {out_path}")
+    print(f"  source: {args.file}")
+    print(f"  sketch vertices: {len(verts)}, circles: {len(circles)}, depth: {depth} cm")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
