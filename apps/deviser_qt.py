@@ -56,6 +56,80 @@ def auto_fillet_radius(ipt):
     return cands[k] * 10.0
 
 
+# ---------------- E1: parameter editing engine ----------------
+import copy
+
+def extract_skeleton(ipt):
+    """Geometry skeleton + parameter->geometry bindings (E1)."""
+    verts, lines, circles = ipt2obj_mod.extract_geometry(ipt)
+    radius = ipt2obj_mod.ellipse_radius(ipt)
+    depth = ipt2obj_mod.extrude_depth(ipt)
+    params = ipt.parameters()
+    fr = 0.0
+    depth_param = None
+    dnums = sorted(int(k[1:]) for k in params
+                   if isinstance(k, str) and k.startswith("d") and k[1:].isdigit()
+                   and isinstance(params[k], float))
+    if len(verts) >= 3:
+        depth_candidates = [n for n in dnums if 2 <= n < 4]
+        depth_param = f"d{depth_candidates[0]}" if depth_candidates else None
+    elif circles:
+        depth_param = "d1"
+    for k, v in params.items():
+        if isinstance(v, float) and k.startswith("d") and k[1:].isdigit() and int(k[1:]) >= 4:
+            fr = v * 10.0
+            break
+    if len(verts) >= 3 and depth > 0:
+        return {"type": "prism", "verts_cm": [tuple(v) for v in verts],
+                "depth_cm": depth, "fillet_r_mm": fr, "depth_param": depth_param}, params
+    elif circles and radius:
+        return {"type": "cylinder", "center_cm": tuple(circles[0][0]),
+                "radius_cm": radius, "depth_cm": depth, "fillet_r_mm": fr,
+                "depth_param": depth_param}, params
+    return None, params
+
+
+def apply_edit(sk, param_name, new_value_cm):
+    sk = copy.deepcopy(sk)
+    if sk["type"] == "cylinder" and param_name == "d0":
+        sk["radius_cm"] = new_value_cm / 2.0
+    elif sk["type"] == "prism" and param_name in ("d0", "d1") and param_name != sk.get("depth_param"):
+        old = max(max(v[0] for v in sk["verts_cm"]), max(v[1] for v in sk["verts_cm"]))
+        scale = new_value_cm / old if old else 1.0
+        sk["verts_cm"] = [(v[0]*scale, v[1]*scale) for v in sk["verts_cm"]]
+    elif param_name == sk.get("depth_param"):
+        sk["depth_cm"] = new_value_cm
+    elif param_name.startswith("d") and param_name[1:].isdigit() and int(param_name[1:]) >= 4:
+        sk["fillet_r_mm"] = new_value_cm * 10.0
+    return sk
+
+
+def rebuild_solid(sk):
+    """Rebuild the solid from a (possibly edited) skeleton via OpenCascade."""
+    import cadquery as cq
+    S = 10.0
+    if sk["type"] == "cylinder":
+        wp = (cq.Workplane("XY")
+              .center(sk["center_cm"][0]*S, sk["center_cm"][1]*S)
+              .circle(sk["radius_cm"]*S)
+              .extrude(sk["depth_cm"]*S))
+    else:
+        wp = (cq.Workplane("XY")
+              .polyline([(v[0]*S, v[1]*S) for v in sk["verts_cm"]])
+              .close().extrude(sk["depth_cm"]*S))
+    if sk["fillet_r_mm"] > 0:
+        wp = wp.edges("|Z").fillet(sk["fillet_r_mm"])
+    return wp
+
+
+def skeleton_to_step(sk, path):
+    """Write the (edited) solid as STEP."""
+    import cadquery as cq
+    wp = rebuild_solid(sk)
+    cq.exporters.export(wp, path)
+    return wp.val().Volume()
+
+
 def build_report(ipt):
     s = ipt.summary()
     lines = [f"File:        {s['file']}",
@@ -119,7 +193,8 @@ def make_step(ipt):
 def run_qt():
     from PySide6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-        QPushButton, QFileDialog, QTextEdit, QLabel, QMessageBox, QSplitter)
+        QPushButton, QFileDialog, QTextEdit, QLabel, QMessageBox, QSplitter,
+        QTableWidget, QTableWidgetItem, QGroupBox, QDoubleSpinBox)
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QPixmap
 
@@ -163,6 +238,26 @@ def run_qt():
             split.setSizes([700, 380])
             root.addWidget(split, stretch=1)
 
+            # ---- E1: Parameter Editor panel ----
+            edit_group = QGroupBox("Parameter Editor (E1) — edit a value, rebuild the solid")
+            ev = QVBoxLayout(edit_group)
+            self.param_table = QTableWidget(0, 2)
+            self.param_table.setHorizontalHeaderLabels(["Parameter", "Value (cm)"])
+            self.param_table.horizontalHeader().setStretchLastSection(True)
+            ev.addWidget(self.param_table)
+            btn_row = QHBoxLayout()
+            self.btn_rebuild = QPushButton("Apply & Rebuild")
+            self.btn_rebuild.clicked.connect(self.rebuild_edited)
+            btn_row.addWidget(self.btn_rebuild)
+            self.btn_step_edited = QPushButton("Export EDITED solid as STEP…")
+            self.btn_step_edited.clicked.connect(self.export_edited_step)
+            btn_row.addWidget(self.btn_step_edited)
+            btn_row.addStretch()
+            ev.addLayout(btn_row)
+            self.edit_status = QLabel("Load an .ipt to edit its parameters.")
+            ev.addWidget(self.edit_status)
+            root.addWidget(edit_group)
+
             btn_open.clicked.connect(self.open_file)
             btn_obj.clicked.connect(self.export_obj)
             btn_step.clicked.connect(self.export_step)
@@ -194,6 +289,33 @@ def run_qt():
                 self.btn_step.setToolTip("pip install --user cadquery to enable")
             else:
                 self.btn_step.setToolTip("")
+
+            # E1: populate the parameter editor
+            self.skeleton, self.orig_params = extract_skeleton(self.ipt)
+            self.param_table.setRowCount(0)
+            if self.skeleton:
+                sortable = sorted(self.orig_params.items(),
+                                  key=lambda kv: (0, int(kv[0][1:])) if kv[0].startswith("d") and kv[0][1:].isdigit() and isinstance(kv[1], float) else (1, 0))
+                for name, val in sortable:
+                    if not isinstance(val, float):
+                        continue
+                    row = self.param_table.rowCount()
+                    self.param_table.insertRow(row)
+                    self.param_table.setItem(row, 0, QTableWidgetItem(str(name)))
+                    sb = QDoubleSpinBox()
+                    sb.setDecimals(4)
+                    sb.setRange(-10000.0, 10000.0)
+                    sb.setValue(float(val))
+                    self.param_table.setCellWidget(row, 1, sb)
+                self.btn_rebuild.setEnabled(True)
+                self.btn_step_edited.setEnabled(HAS_CQ)
+                self.edit_status.setText(
+                    f"Skeleton: {self.skeleton['type']}; depth param: {self.skeleton.get('depth_param')}. "
+                    "Edit values, then Apply & Rebuild.")
+            else:
+                self.btn_rebuild.setEnabled(False)
+                self.btn_step_edited.setEnabled(False)
+                self.edit_status.setText("No editable geometry skeleton in this file.")
 
         def _loaded(self):
             if not self.ipt:
@@ -231,6 +353,44 @@ def run_qt():
                     self, "Deviser", f"Exported exact solid:\n{p}")
             except Exception as e:
                 QMessageBox.critical(self, "Deviser", f"STEP export failed:\n{e}")
+
+        def rebuild_edited(self):
+            if not getattr(self, "skeleton", None):
+                return
+            sk = copy.deepcopy(self.skeleton)
+            for row in range(self.param_table.rowCount()):
+                name_item = self.param_table.item(row, 0)
+                sb = self.param_table.cellWidget(row, 1)
+                if name_item is None or sb is None:
+                    continue
+                sk = apply_edit(sk, name_item.text(), sb.value())
+            try:
+                wp = rebuild_solid(sk)
+                vol = wp.val().Volume()
+                self.edit_status.setText(f"Rebuilt ✓  volume: {vol:.2f} mm³  "
+                                         f"({wp.val().Faces().__len__()} faces)")
+                self.edited_skeleton = sk
+            except Exception as e:
+                QMessageBox.warning(self, "Deviser", f"Rebuild failed:\n{e}")
+
+        def export_edited_step(self):
+            if not getattr(self, "edited_skeleton", None):
+                self.rebuild_edited()
+            if not getattr(self, "edited_skeleton", None):
+                QMessageBox.information(self, "Deviser", "Rebuild first.")
+                return
+            p, _ = QFileDialog.getSaveFileName(
+                self, "Export EDITED solid", 
+                os.path.splitext(self.ipt.path)[0] + "_edited.step",
+                "STEP (*.step *.stp)")
+            if not p:
+                return
+            try:
+                vol = skeleton_to_step(self.edited_skeleton, p)
+                QMessageBox.information(
+                    self, "Deviser", f"Exported EDITED solid:\n{p}\nvolume {vol:.2f} mm³")
+            except Exception as e:
+                QMessageBox.critical(self, "Deviser", f"Export failed:\n{e}")
 
         def export_json(self):
             if not self._loaded():
