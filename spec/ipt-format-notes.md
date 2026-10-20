@@ -556,6 +556,48 @@ The RDxVar0 expression table (found session 12) is now fully decoded:
   the graph will reveal the d->MyWidth binding; the rebuild engine can
   then propagate MyWidth edits through d-params to geometry.
 
+
+## 7r. Session 14 — GROUND-TRUTH BATCH: E1.5 PROVEN, .iam FORMAT MAPPED
+
+### linked.ipt — E1.5 parameter linking CONFIRMED
+- Params: MyWidth=2.0cm(20mm), d2=2.0cm(sketch X dim), d4=0.8cm(extrude 8mm)
+- Expression graph: MyWidth -> [RDxVar0, d2, d3, d4, d5]
+- BINDING PROVEN: MyWidth(user param) drives d2(sketch X dim):
+  value equality (2.0=2.0) + graph scope + X extent (20mm) ✓
+- E1.5 LOOP VERIFIED: MyWidth edit 20->35mm => solid rebuilds 1866.76 mm³
+  (expected 35*6.667*8 = 1866.8) ✓
+- Discovery: linked.ipt stores ALL 8 solid corners as explicit points
+  (full box B-rep), not just 4 sketch corners — extractor must dedupe.
+- New unit pair seen: MyWidth uses (0x59, 0x5a).
+
+### twofeat.ipt — MULTI-FEATURE confirmed
+- Params: d0-d3 (cube sketch), d4=0.5cm (circle Ø5mm), d5=0.6cm (extrude 6mm)
+- Topology: body x2, lump x2, shell x2 — TWO BODIES in one file!
+- The second feature (circle on top face) creates its own body+lump.
+- E3 multi-body extraction from .ipt: params + 2 bodies identifiable.
+
+### chamfer.ipt — CHAMFER CONFIRMED
+- Params: d4=0.2cm, d5=0.2cm (chamfer 2mm x2), d6=0.7853981633974483
+  (= pi/4 — the chamfer ANGLE in radians! 45°)
+- Topology: 12 faces (cube 6 + chamfer adds 6: 4 chamfer faces + edge splits)
+- Chamfer record: TWO distance params + ONE angle param (pi/4 = 45°)
+
+### hole.ipt — HOLE CONFIRMED
+- Params: d4=0.5cm (Ø5mm), d5=0.6cm, d6=0.4cm, d7=0.2cm, d8=1.5708 (=pi/2!),
+  d9=0.8cm, d10=2.059... (likely drill depth/angle combo)
+- Topology: 10 faces (cube 6 + cylindrical hole + splits)
+- Hole = diameter param + pi/2 angle + depth params.
+
+### assembly.iam — FORMAT = SAME AS .ipt!
+- OLE/CFB container ✓, same \x05 property streams ✓, RSeStorage ✓,
+  RSeEmbeddings ✓, UFRxDoc ✓, Protein ✓
+- NEW: CacheGraphics/ storage (OGS/DefaultScene = assembly scene cache)
+- NEW: RSeStorage/RefdFiles/ = REFERENCED FILES (.ipt parts!)
+- Conclusion: ALL Deviser tooling applies to .iam directly (.deva roadmap
+  = trivial rename + RefdFiles handling + constraint decode).
+
+All 5 ground-truth samples validate the engines built in E1-E4.
+
 ## 8. Open questions / next probes
 1. Parameter record full grammar: unit token, parameter type/flags,
   tolerance fields, multi-parameter files (B2c with 3 params?)
