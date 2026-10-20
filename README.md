@@ -5,11 +5,15 @@ entirely from observational format analysis (no decompilation).
 
 ## What it does
 
+- **New Part…** — create Deviser-native parts from scratch (rect/circle, extrude, fillet)
 - **Inspect** `.ipt` files: title, author, material, parameters (length/angle/
-  text/model dims), topology, thumbnail
+  text/model dims), dependency graph, topology, thumbnail
+- **Edit** parameters (E1): change any dimension → solid rebuilds → export the edited solid
+- **Save/Load .devp** — Deviser's native format (zstd+JSON, versioned)
+- **Multi-body parts** (E3): stacked/added/cut features
 - **Export OBJ** (tessellated mesh, mm)
-- **Export STEP** (exact analytic solids via OpenCascade; includes automatic
-  fillet feature replay — volumes verified to 4 decimals)
+- **Export STEP** (exact analytic solids via OpenCascade; fillet replay
+  verified to 4 decimals)
 - **Save JSON** (all extracted data)
 
 ## One-file app (Linux / Bazzite KDE)
