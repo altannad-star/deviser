@@ -324,35 +324,49 @@ def _assembly_payload(ole):
         out.append(d)
     return out
 
+def _is_browser_class(cls):
+    """Browser-node class names (session 16 ground truth); rejects the
+    material/thread-table records that share the same encoding."""
+    return (cls.startswith(("Am", "NBx", "UCx", "BRx", "DCx"))
+            or cls in ("OriginEntryFolder", "OriginWorkFeatureEntry"))
+
 def _read_tree_entries(payload):
-    """Parse the browser-tree record grammar (session 16):
-        [u32 namelen][UTF16 name][u32 classlen][ASCII class name][refs...]
-      Names are pure-ASCII UTF16. Records sit on 16-byte framing.
+    """Parse the browser-tree record grammar (sessions 16/16c — CORRECTED):
+        [u32 namelen][UTF16 name][u32 classlen][UTF16 class name][refs...]
+      Both the name AND the class name are UTF-16 (session-16c discovery:
+      the class strings are stored wide, which is why the earlier ASCII
+      scan only caught the 4 filter records).
+      Verified on assembly.iam: 9 records incl. AmDocEntry root,
+      2x AmPartInstEntry, AmMateEntry, OriginEntryFolder, AmViewRep.
     """
     entries = []
     pos = 0
     b = payload
     n = len(b)
     while pos + 8 <= n:
-        if b[pos:pos+4] == b"\x00\x00\x00\x00" and (pos % 16) == 0:
-            pos += 4
-            continue
         nl = struct.unpack_from("<I", b, pos)[0]
-        if 1 <= nl <= 256 and pos + 4 + nl * 2 <= n:
+        ok = False
+        if 1 <= nl <= 200 and pos + 4 + nl * 2 + 8 <= n:
             raw = b[pos+4:pos+4+nl*2]
-            if (all(raw[i] < 0x80 for i in range(0, len(raw), 2))
-                    and all(raw[i] == 0 for i in range(1, len(raw), 2))
-                    and 0x20 <= raw[0] < 0x7f):
-                name = raw.decode("utf-16-le")
+            c1 = all(0x20 <= raw[i] < 0x7f for i in range(0, len(raw), 2))
+            c2 = all(raw[i] == 0 for i in range(1, len(raw), 2))
+            if c1 and c2:
                 p2 = pos + 4 + nl * 2
-                cl = struct.unpack_from("<I", b, p2)[0] if p2 + 4 <= n else -1
-                if 1 <= cl <= 128 and p2 + 4 + cl <= n:
-                    cls = b[p2+4:p2+4+cl]
-                    if all(0x20 <= c < 0x7f for c in cls):
-                        entries.append({"name": name, "class": cls.decode("latin1"), "offset": pos})
-                        pos = p2 + 4 + cl
-                        continue
-        pos += 1
+                cl = struct.unpack_from("<I", b, p2)[0]
+                if 1 <= cl <= 120 and p2 + 4 + cl * 2 <= n:
+                    craw = b[p2+4:p2+4+cl*2]
+                    d1 = all(0x20 <= craw[i] < 0x7f for i in range(0, len(craw), 2))
+                    d2 = all(craw[i] == 0 for i in range(1, len(craw), 2))
+                    if d1 and d2:
+                        entries.append({
+                            "name": raw.decode("utf-16-le"),
+                            "class": craw.decode("utf-16-le"),
+                            "offset": pos,
+                        })
+                        pos = p2 + 4 + cl * 2
+                        ok = True
+        if not ok:
+            pos += 1
     return entries
 
 def _utf16_ascii_name(b, p):
@@ -694,16 +708,21 @@ class IptFile:
         return dict(c)
 
     def assembly_tree(self):
-        """Session 16: browser-tree entries [{name, class, offset}] from
-        the .iam Bl2pnvpg-family payload. Empty for plain .ipt parts."""
+        """Sessions 16/16c: browser-tree entries [{name, class, offset}]
+        from the .iam tree payload — records whose class is a browser
+        node type (AmDocEntry, AmPartInstEntry, AmMateEntry, ...).
+        Material/thread tables that share the record grammar are
+        filtered out. Empty for plain .ipt parts."""
         if not hasattr(self, "_amtree"):
             self._amtree = []
             if self.path.lower().endswith(".iam"):
+                best = []
                 for v in _assembly_payload(self.ole):
-                    ents = _read_tree_entries(v)
-                    if len(ents) > len(self._amtree):
-                        self._amtree = ents
-                        self._amtree_payload = v
+                    ents = [e for e in _read_tree_entries(v)
+                            if _is_browser_class(e["class"])]
+                    if len(ents) > len(best):
+                        best = ents
+                self._amtree = best
         return self._amtree
 
     def occurrences(self):

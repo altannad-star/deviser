@@ -790,6 +790,37 @@ AppImage: Deviser-D4-1.8-x86_64.AppImage
   (md5 d490cf373efddcfbc07863866a698bd9, 62 MB) — all four formats
   plus sketch editor, parameter editor, feature replay, assembly view.
 
+## 7aa. Session 16c — CORRECTED TREE GRAMMAR: FULL BROWSER TREE
+
+Root cause of the 4-record shortfall (session 16b): the CLASS names in
+the browser-tree records are stored UTF-16, not ASCII — the record
+grammar is:
+
+  [u32 namelen][UTF16 name][u32 classlen][UTF16 class name][refs...]
+
+With wide classes the walker recovers the full session-16 tree from
+assembly.iam (9 records):
+  'New Assembly'            -> AmDocEntry          (root)
+  "Engineer's Notebook"    -> NBxNotebook
+  'Constraints'             -> AmConstraintsEntry
+  'Origin'                  -> OriginEntryFolder
+  'D - simple part:1'       -> AmPartInstEntry
+  'Cyl:1'                   -> AmPartInstEntry
+  'UCxModelStatesFolder...' -> UCxModelStatesFolderEntry
+  'Mate:1'                  -> AmMateEntry         (THE CONSTRAINT)
+  'Default'                 -> AmViewRep
+
+The same record grammar also encodes the material/thread tables in
+other payloads (84 raw hits) — filtered by browser-class prefix
+(Am/NBx/UCx/BRx/DCx/Origin).
+
+.deva impact: constraints[] now populated from real tree records —
+assembly.iam exports 'Mate:1' type Mate (was empty). GUI assembly
+view lists constraints with their classes. Round-trips still exact.
+
+AppImage: Deviser-16c-1.9-x86_64.AppImage
+  (md5 80b7a4631bbd58bbc88d503252b5821e, 62 MB)
+
 ## 8. Open questions / next probes
 1. Parameter record full grammar: unit token, parameter type/flags,
   tolerance fields, multi-parameter files (B2c with 3 params?)

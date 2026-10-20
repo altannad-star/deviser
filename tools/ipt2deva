@@ -102,15 +102,17 @@ def make_deva(iam_path, part_resolver=None):
                     p["placed"] = True
                     p["transform"] = t + [0.0] * (12 - len(t))
 
-        # Constraints: AmMateEntry names (session 16) — iptinfo's tree
-        # decoder reports browser filters; mates come from the occ layer
-        # where the name matches 'Mate'/'Insert'/'Angle' patterns.
+        # Constraints: session 16c — real tree entries with constraint
+        # classes (AmMateEntry and friends) from assembly_tree().
         constraints = []
-        for o in occs:
-            n = o["name"]
-            if any(n.startswith(k) for k in ("Mate", "Insert", "Angle",
-                                             "Tangent", "Flush")):
-                constraints.append({"name": n, "type": n.rsplit(":", 1)[0]})
+        for e in tree:
+            cls = e.get("class", "")
+            if cls in ("AmMateEntry", "AmInsertEntry", "AmAngleConstraintEntry",
+                       "AmTangentEntry", "AmFlushEntry"):
+                constraints.append({
+                    "name": e["name"],
+                    "type": cls[2:].replace("Entry", ""),
+                })
 
         doc = {
             "format": "deva",

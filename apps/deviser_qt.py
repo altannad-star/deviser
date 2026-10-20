@@ -911,12 +911,15 @@ def run_qt():
                 lines.append("Placed transforms:")
                 for t in placed:
                     lines.append(f"  {[round(v, 4) for v in t]}")
-            cons = [o for o in occs
-                    if any(o['name'].startswith(k) for k in
-                           ("Mate", "Insert", "Angle", "Tangent", "Flush"))]
+            tree = s.get("assembly_tree") or []
+            cons = [e for e in tree
+                    if e.get("class", "") in
+                    ("AmMateEntry", "AmInsertEntry", "AmAngleConstraintEntry",
+                     "AmTangentEntry", "AmFlushEntry")]
             if cons:
-                lines.append(f"Constraints ({len(cons)}): "
-                             + ", ".join(c['name'] for c in cons))
+                lines.append("Constraints: "
+                             + ", ".join(f"{c['name']} [{c['class'][2:-5]}]"
+                                          for c in cons))
             lines.append("")
             lines.append("(Assembly decode: clean-room, session 16-17. "
                          "Save as .deva via File dialog filter.)")
