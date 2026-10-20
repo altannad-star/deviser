@@ -65,39 +65,98 @@ iptinfo = _load("iptinfo", "iptinfo")
 ipt2obj = _load("ipt2obj", "ipt2obj_mod")
 
 
+def classify_features(params):
+    """Session-14/15 grammars -> ordered feature list from params."""
+    import math
+    feats = []
+    has_ch = any(isinstance(v, float) and abs(abs(v) - math.pi/4) < 0.01 for v in params.values())
+    has_hole = any(isinstance(v, float) and abs(abs(v) - math.pi/2) < 0.01 for v in params.values())
+    has_angle = has_ch or has_hole
+    feat = sorted((int(k[1:]), v) for k, v in params.items()
+                  if isinstance(k, str) and k.startswith("d") and k[1:].isdigit()
+                  and isinstance(v, float) and 1e-9 < abs(v) < 3.0 and int(k[1:]) >= 4)
+    if has_ch:
+        dists = [v for n, v in feat if abs(v) < 1.0]
+        feats.append({"op": "chamfer", "mm": (dists[0] if dists else 0.2) * 10.0})
+    elif has_hole:
+        dias = [v for n, v in feat]
+        feats.append({"op": "hole", "dia_mm": (dias[0] if dias else 0.5) * 10.0})
+    elif not has_angle and len(feat) >= 2:
+        feats.append({"op": "boss", "dia_mm": feat[0][1] * 10.0,
+                      "depth_mm": feat[1][1] * 10.0})
+    return feats
+
+
 def skeleton_from_ipt(ipt):
-    """Extract the E1 geometry skeleton + params from an open .ipt."""
-    import copy
-    verts, lines, circles = ipt2obj.extract_geometry(ipt)
+    """Extract the geometry skeleton + params (session-15 rules)."""
+    import copy, math
+    raw = ipt.asm_sketch_vertices()
+    plane = [v for v in raw if abs(float(v[2])) < 1e-9]
+    if len(plane) >= 3:
+        verts = ipt2obj._canonical_polygon(plane)
+        circles = []
+    else:
+        verts, lines, circles = ipt2obj.extract_geometry(ipt)
     radius = ipt2obj.ellipse_radius(ipt)
     depth = ipt2obj.extrude_depth(ipt)
     params = ipt.parameters()
-    fr = 0.0
-    depth_param = None
+    features = classify_features(params)
+
     dnums = sorted(int(k[1:]) for k in params
                    if isinstance(k, str) and k.startswith("d") and k[1:].isdigit()
                    and isinstance(params[k], float))
     if len(verts) >= 3:
-        dc = [n for n in dnums if 2 <= n < 4]
-        depth_param = f"d{dc[0]}" if dc else None
+        p1 = params.get("d1")
+        if isinstance(p1, float) and abs(p1) > 1e-9:
+            depth_param = "d1"
+        else:
+            x_ext = max((v[0] for v in verts), default=None)
+            y_ext = max((v[1] for v in verts), default=None)
+            depth_param = None
+            for n in dnums:
+                if n < 2:
+                    continue
+                v = params.get(f"d{n}")
+                if not isinstance(v, float) or abs(v) < 1e-9 or abs(v) >= 3.0:
+                    continue
+                if x_ext is not None and abs(v - x_ext) < 1e-9:
+                    continue
+                if y_ext is not None and abs(v - y_ext) < 1e-9:
+                    continue
+                depth_param = f"d{n}"
+                break
     elif circles:
         depth_param = "d1"
-    for k, v in params.items():
-        if isinstance(v, float) and k.startswith("d") and k[1:].isdigit() and int(k[1:]) >= 4:
-            fr = v * 10.0
-            break
+    else:
+        depth_param = None
+
+    fr = 0.0
+    if not features:
+        sketch_depth_nums = set()
+        if depth_param:
+            sketch_depth_nums.add(int(depth_param[1:]))
+        simple_d = sorted((int(k[1:]), v) for k, v in params.items()
+                          if isinstance(k, str) and k.startswith("d") and k[1:].isdigit()
+                          and isinstance(v, float) and 1e-9 < abs(v) < 3.0)
+        sketch_depth_nums.update(n for n, _ in simple_d if n <= 3)
+        extras = [(n, v) for n, v in simple_d
+                  if n not in sketch_depth_nums and f"d{n}" != depth_param]
+        if len(extras) == 1:
+            fr = extras[0][1] * 10.0
+
     if len(verts) >= 3 and depth > 0:
-        return {"type": "prism",
-                "verts_cm": [[v[0], v[1]] for v in verts],
+        skel = {"type": "prism", "verts_cm": [tuple(v) for v in verts],
                 "depth_cm": depth, "fillet_r_mm": fr, "chamfer_mm": 0.0,
-                "holes": [], "depth_param": depth_param}, params
+                "holes": [], "depth_param": depth_param,
+                "_orig_params": {k: v for k, v in params.items() if isinstance(v, float)}}
+        return skel, params
     elif circles and radius:
-        return {"type": "cylinder",
-                "center_cm": [circles[0][0][0], circles[0][0][1]],
+        return {"type": "cylinder", "center_cm": [circles[0][0][0], circles[0][0][1]],
                 "radius_cm": radius, "depth_cm": depth,
-                "fillet_r_mm": fr, "chamfer_mm": 0.0,
-                "holes": [], "depth_param": depth_param}, params
+                "fillet_r_mm": fr, "chamfer_mm": 0.0, "holes": [],
+                "depth_param": depth_param}, params
     return None, params
+
 
 
 def make_devp(ipt_path):
@@ -106,7 +165,8 @@ def make_devp(ipt_path):
         s = ipt.summary()
         skeleton, params = skeleton_from_ipt(ipt)
         params_clean = {k: v for k, v in params.items() if isinstance(v, (int, float, str))}
-        doc = {
+        features = classify_features(params_clean) if skeleton else []
+    doc = {
             "format": "devp",
             "version": VERSION,
             "units": "mm",
@@ -118,7 +178,9 @@ def make_devp(ipt_path):
             },
             "parameters": params_clean,
             "skeleton": skeleton,
-            "history": _history_from_skeleton(skeleton),
+            "features": features,
+            "history": _history_from_skeleton(skeleton) + [
+                {"op": f["op"], **{k2: v2 for k2, v2 in f.items() if k2 != "op"}} for f in features],
             "provenance": {"source": "ipt", "original_file": os.path.basename(ipt_path)},
         }
     return doc
@@ -174,9 +236,36 @@ def load_devp(path):
 
 
 def devp_to_solid(doc):
-    """Rebuild the solid from a .devp document (via OpenCascade)."""
+    """Rebuild the solid from a .devp document (base + feature replay)."""
     sk = doc["skeleton"]
-    return skeleton_to_solid(sk)
+    wp = skeleton_to_solid(sk)
+    feats = doc.get("features") or []
+    if feats:
+        wp = _replay_features(wp, feats, sk)
+    return wp
+
+
+def _replay_features(wp, feats, sk):
+    import cadquery as cq
+    for f in feats:
+        if f["op"] == "chamfer":
+            wp = wp.edges("|Z").chamfer(f["mm"])
+        elif f["op"] == "hole":
+            xs = [v[0] for v in sk["verts_cm"]]
+            ys = [v[1] for v in sk["verts_cm"]]
+            cx = (min(xs) + max(xs)) / 2 * 10.0
+            cy = (min(ys) + max(ys)) / 2 * 10.0
+            wp = wp.faces(">Z").workplane().center(cx, cy).hole(f["dia_mm"])
+        elif f["op"] == "boss":
+            base_depth = sk["depth_cm"] * 10.0
+            xs = [v[0] for v in sk["verts_cm"]]
+            ys = [v[1] for v in sk["verts_cm"]]
+            cx = (min(xs) + max(xs)) / 2 * 10.0
+            cy = (min(ys) + max(ys)) / 2 * 10.0
+            wp = wp.union(cq.Workplane("XY").workplane(offset=base_depth)
+                          .center(cx, cy).circle(f["dia_mm"] / 2)
+                          .extrude(f["depth_mm"]))
+    return wp
 
 
 def _single_body_solid(sk):

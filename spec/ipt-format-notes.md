@@ -629,6 +629,20 @@ classify_features() + replay_features() + rebuild_full() implemented:
 Deviser now replays: sketch + extrude + fillet + chamfer + hole + boss
 from clean-room-decoded .ipt data, every volume closed-form-exact.
 
+
+## 7u. Session 15b — .devp FEATURE PERSISTENCE + GUI replay shipped
+
+- ipt2devp: features[] serialized into .devp docs (chamfer/hole/boss with
+  params); history[] includes feature ops; skeleton_from_ipt now uses the
+  full session-15 rules (z-plane filter, angle grammars, robust depth)
+- devp_to_solid: replays features on load — .devp round-trip verified:
+  chamfer 920.00 ✓ hole 803.65 ✓ boss 1117.81 ✓ fillet 991.42 ✓
+  linked 1066.67 ✓ cyl 523.17 ✓ cube 1000.00 ✓ (7/7 exact)
+- GUI: feature replay wired into Rebuild + Export buttons (AppImage FR-1.5)
+- The full pipeline is now end-to-end feature-aware:
+  .ipt -> parse -> classify -> skeleton+features -> edit -> rebuild+replay
+  -> save .devp (features persist) -> reopen -> replay -> export STEP
+
 ## 8. Open questions / next probes
 1. Parameter record full grammar: unit token, parameter type/flags,
   tolerance fields, multi-parameter files (B2c with 3 params?)
