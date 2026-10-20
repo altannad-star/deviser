@@ -45,6 +45,14 @@ try:
     ipt2devx_mod = load_module("ipt2devx", "ipt2devx_mod")
 except Exception:
     ipt2devx_mod = None
+try:
+    devrender_mod = load_module("devrender", "devrender_mod")
+except Exception:
+    devrender_mod = None
+try:
+    devexpr_mod = load_module("devexpr", "devexpr_mod")
+except Exception:
+    devexpr_mod = None
 IptFile = iptinfo.IptFile
 try:
     ipt2devp_mod = load_module("ipt2devp", "ipt2devp_mod")
@@ -604,23 +612,62 @@ def run_qt():
             self.thumb = QLabel("(nothing loaded)")
             self.thumb.setAlignment(Qt.AlignCenter)
             self.thumb.setMinimumWidth(340)
+            self.thumb.setMaximumHeight(260)
             pv.addWidget(self.thumb)
+            # ---- WS1: 3D viewport (software renderer) ----
+            vp_group = QGroupBox("3D Viewport (WS1)")
+            vv = QVBoxLayout(vp_group)
+            self.view3d = QLabel("load a part + Rebuild to see it")
+            self.view3d.setAlignment(Qt.AlignCenter)
+            self.view3d.setMinimumHeight(300)
+            self.view3d.setStyleSheet("background: #24262c; color: #888;")
+            vv.addWidget(self.view3d)
+            vb = QHBoxLayout()
+            for name, daz, de_ in (("Front", 0, 0), ("Top", 0, 90),
+                                   ("Right", 90, 0), ("Iso", 35, 25)):
+                b = QPushButton(name)
+                b.clicked.connect(lambda _, a=daz, e=de_: self.set_view(a, e))
+                vb.addWidget(b)
+            self.btn_spin_l = QPushButton("<")
+            self.btn_spin_l.clicked.connect(lambda: self.spin_view(-15, 0))
+            self.btn_spin_r = QPushButton(">")
+            self.btn_spin_r.clicked.connect(lambda: self.spin_view(15, 0))
+            self.btn_spin_u = QPushButton("^")
+            self.btn_spin_u.clicked.connect(lambda: self.spin_view(0, 10))
+            self.btn_spin_d = QPushButton("v")
+            self.btn_spin_d.clicked.connect(lambda: self.spin_view(0, -10))
+            vb.addWidget(self.btn_spin_l)
+            vb.addWidget(self.btn_spin_r)
+            vb.addWidget(self.btn_spin_u)
+            vb.addWidget(self.btn_spin_d)
+            vb.addStretch()
+            vv.addLayout(vb)
+            pv.addWidget(vp_group, stretch=1)
+            self.view_azim = 35
+            self.view_elev = 25
             self.thumb_panel = panel
             split.addWidget(panel)
-            split.setSizes([700, 380])
+            split.setSizes([700, 460])
             root.addWidget(split, stretch=1)
 
             # ---- E1: Parameter Editor panel ----
             edit_group = QGroupBox("Parameter Editor (E1) — edit a value, rebuild the solid")
             ev = QVBoxLayout(edit_group)
-            self.param_table = QTableWidget(0, 2)
-            self.param_table.setHorizontalHeaderLabels(["Parameter", "Value (cm)"])
+            self.param_table = QTableWidget(0, 3)
+            self.param_table.setHorizontalHeaderLabels(
+                ["Parameter", "Value (cm)", "= expression (e.g. d0*2)"])
             self.param_table.horizontalHeader().setStretchLastSection(True)
             ev.addWidget(self.param_table)
             btn_row = QHBoxLayout()
             self.btn_rebuild = QPushButton("Apply & Rebuild")
             self.btn_rebuild.clicked.connect(self.rebuild_edited)
             btn_row.addWidget(self.btn_rebuild)
+            self.btn_undo = QPushButton("Undo")
+            self.btn_undo.clicked.connect(self.do_undo)
+            btn_row.addWidget(self.btn_undo)
+            self.btn_redo = QPushButton("Redo")
+            self.btn_redo.clicked.connect(self.do_redo)
+            btn_row.addWidget(self.btn_redo)
             self.btn_step_edited = QPushButton("Export EDITED solid as STEP…")
             self.btn_step_edited.clicked.connect(self.export_edited_step)
             btn_row.addWidget(self.btn_step_edited)
@@ -642,6 +689,142 @@ def run_qt():
             btn_step.clicked.connect(self.export_step)
             btn_json.clicked.connect(self.export_json)
             self.btn_step = btn_step
+
+        # ---- WS1: viewport control + WS2: expressions + WS3: undo ----
+
+        def set_view(self, azim, elev):
+            self.view_azim = azim
+            self.view_elev = elev
+            self.render_current()
+
+        def spin_view(self, daz, delev):
+            self.view_azim += daz
+            self.view_elev = max(-89, min(89, self.view_elev + delev))
+            self.render_current()
+
+        def render_current(self):
+            """Rebuild + render the current solid into the viewport."""
+            if devrender_mod is None or not HAS_CQ:
+                return
+            sk = getattr(self, "skeleton", None)
+            if sk is None:
+                return
+            try:
+                wp = rebuild_solid(copy.deepcopy(sk))
+                feats = getattr(self, "features", None)
+                if feats:
+                    wp = replay_features(wp, feats, sk)
+                png = devrender_mod.render_solid(
+                    wp, size=(430, 330),
+                    azim=getattr(self, "view_azim", 35),
+                    elev=getattr(self, "view_elev", 25))
+                pm = QPixmap()
+                pm.loadFromData(png)
+                self.view3d.setPixmap(pm)
+                self.edit_status.setText(
+                    f"Viewport: volume {wp.val().Volume():.2f} mm^3 "
+                    f"(azim {self.view_azim}, elev {self.view_elev})")
+            except Exception as e:
+                self.edit_status.setText(f"Viewport error: {e}")
+
+        def _table_values(self):
+            vals = {}
+            for row in range(self.param_table.rowCount()):
+                ni = self.param_table.item(row, 0)
+                sb = self.param_table.cellWidget(row, 1)
+                if ni is not None and sb is not None:
+                    vals[ni.text()] = sb.value()
+            return vals
+
+        def push_undo(self, label):
+            """WS3: snapshot state for undo/redo. The snapshot's table holds
+            the ORIGINAL parameter values (pre-edit state); the current
+            (edited) table is captured at undo-time into the redo stack."""
+            orig = getattr(self, "orig_params", {}) or {}
+            table0 = {}
+            for name, v in orig.items():
+                if isinstance(v, (int, float)):
+                    table0[name] = float(v)
+            snap = {
+                "skeleton": copy.deepcopy(getattr(self, "skeleton", None)),
+                "features": copy.deepcopy(getattr(self, "features", None)),
+                "orig_params": dict(orig),
+                "table": table0,
+                "label": label,
+            }
+            if not hasattr(self, "_undo_stack"):
+                self._undo_stack = []
+                self._redo_stack = []
+            self._undo_stack.append(snap)
+            if len(self._undo_stack) > 50:
+                self._undo_stack.pop(0)
+            self._redo_stack.clear()
+
+        def do_undo(self):
+            if not getattr(self, "_undo_stack", None):
+                self.edit_status.setText("Nothing to undo.")
+                return
+            snap = self._undo_stack.pop()
+            cur = {
+                "skeleton": copy.deepcopy(getattr(self, "skeleton", None)),
+                "features": copy.deepcopy(getattr(self, "features", None)),
+                "orig_params": dict(getattr(self, "orig_params", {}) or {}),
+                "table": self._table_values(),
+                "label": snap["label"],
+            }
+            self._redo_stack.append(cur)
+            self.skeleton = snap["skeleton"]
+            self.features = snap["features"]
+            self.orig_params = snap["orig_params"]
+            self._reload_param_table()
+            self._apply_table_values(snap.get("table") or {})
+            self.render_current()
+            self.edit_status.setText(f"Undid: {snap['label']}")
+
+        def do_redo(self):
+            if not getattr(self, "_redo_stack", None):
+                self.edit_status.setText("Nothing to redo.")
+                return
+            snap = self._redo_stack.pop()
+            cur = {
+                "skeleton": copy.deepcopy(getattr(self, "skeleton", None)),
+                "features": copy.deepcopy(getattr(self, "features", None)),
+                "orig_params": dict(getattr(self, "orig_params", {}) or {}),
+                "table": self._table_values(),
+                "label": snap["label"],
+            }
+            self._undo_stack.append(cur)
+            self.skeleton = snap["skeleton"]
+            self.features = snap["features"]
+            self.orig_params = snap["orig_params"]
+            self._reload_param_table()
+            self._apply_table_values(snap.get("table") or {})
+            self.render_current()
+            self.edit_status.setText(f"Redid: {snap['label']}")
+
+        def _reload_param_table(self):
+            self.param_table.setRowCount(0)
+            params = getattr(self, "orig_params", {}) or {}
+            for name in sorted(params):
+                val = params[name]
+                if not isinstance(val, (int, float)):
+                    continue
+                row = self.param_table.rowCount()
+                self.param_table.insertRow(row)
+                self.param_table.setItem(row, 0, QTableWidgetItem(str(name)))
+                sb = QDoubleSpinBox()
+                sb.setDecimals(4)
+                sb.setRange(-10000.0, 10000.0)
+                sb.setValue(float(val))
+                self.param_table.setCellWidget(row, 1, sb)
+                self.param_table.setItem(row, 2, QTableWidgetItem(""))
+
+        def _apply_table_values(self, values):
+            for row in range(self.param_table.rowCount()):
+                ni = self.param_table.item(row, 0)
+                sb = self.param_table.cellWidget(row, 1)
+                if ni is not None and sb is not None and ni.text() in values:
+                    sb.setValue(float(values[ni.text()]))
 
         def open_file(self):
             p, _ = QFileDialog.getOpenFileName(
@@ -750,13 +933,35 @@ def run_qt():
         def rebuild_edited(self):
             if not getattr(self, "skeleton", None):
                 return
+            self.push_undo("edit")           # WS3: snapshot before applying
             sk = copy.deepcopy(self.skeleton)
+            orig = getattr(self, "orig_params", {}) or {}
             for row in range(self.param_table.rowCount()):
                 name_item = self.param_table.item(row, 0)
                 sb = self.param_table.cellWidget(row, 1)
                 if name_item is None or sb is None:
                     continue
-                sk = apply_edit_linked(sk, name_item.text(), sb.value(),
+                name = name_item.text()
+                old_val = orig.get(name)
+                new_val = sb.value()
+                # WS2: expression column overrides the numeric value
+                expr_item = self.param_table.item(row, 2)
+                if expr_item is not None and expr_item.text().strip():
+                    try:
+                        table = {k: v for k, v in orig.items()
+                                 if isinstance(v, (int, float))}
+                        table[name] = expr_item.text()
+                        new_val = devexpr_mod.resolve_table(
+                            {k: (v if isinstance(v, (int, float)) else str(v))
+                             for k, v in table.items()})[name] \
+                            if devexpr_mod else new_val
+                    except Exception as e:
+                        self.edit_status.setText(
+                            f"Expression error for {name}: {e}")
+                        return
+                if isinstance(old_val, (int, float)) and abs(new_val - float(old_val)) < 1e-12:
+                    continue          # unchanged: don't re-apply
+                sk = apply_edit_linked(sk, name, new_val,
                                        getattr(self, "ipt", None))
             try:
                 wp = rebuild_solid(sk)
@@ -768,6 +973,8 @@ def run_qt():
                 self.edit_status.setText(f"Rebuilt ✓{fdesc}  volume: {vol:.2f} mm³  "
                                          f"({wp.val().Faces().__len__()} faces)")
                 self.edited_skeleton = sk
+                self.skeleton = sk            # WS1: keep viewport in sync
+                self.render_current()         # WS1: draw it
             except Exception as e:
                 QMessageBox.warning(self, "Deviser", f"Rebuild failed:\n{e}")
 

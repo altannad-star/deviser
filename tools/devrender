@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""devrender — software 3D renderer for Deviser (no GPU/OpenGL needed).
+
+Renders a CadQuery solid to a PNG image using a small numpy z-buffer
+rasterizer with flat-lambert shading. Designed to run inside the AppImage
+(headless-safe, no Qt visualization stack required).
+
+Usage as a module:
+    png = render_solid(workplane, size=(700,560), azim=35, elev=25)
+    png = render_devp(path, ...)          # convenience: load + rebuild
+CLI:
+    python3 devrender part.devp -o render.png [--azim 35 --elev 25]
+"""
+import sys
+import os
+import struct
+import math
+
+def _tessellate(wp, tolerance=0.4):
+    """Solid -> (verts, triangles). CadQuery tessellate on the Shape."""
+    shape = wp.val()
+    verts, tris = shape.tessellate(tolerance)
+    return [(v.x, v.y, v.z) for v in verts], [(t[0], t[1], t[2]) for t in tris]
+
+def _camera(verts, size, azim, elev, dist_scale=2.6):
+    """Compute projection: rotate by azimuth/elevation, orthographic fit."""
+    W, H = size
+    xs = [v[0] for v in verts]; ys = [v[1] for v in verts]; zs = [v[2] for v in verts]
+    cx, cy, cz = (min(xs)+max(xs))/2, (min(ys)+max(ys))/2, (min(zs)+max(zs))/2
+    span = max(max(xs)-min(xs), max(ys)-min(ys), max(zs)-min(zs)) or 1.0
+    a, e = math.radians(azim), math.radians(elev)
+    ca, sa, ce, se = math.cos(a), math.sin(a), math.cos(e), math.sin(e)
+    # view axes (right, up, depth)
+    rx, ry, rz = ca, sa, 0.0
+    ux, uy, uz = -sa*se, ca*se, ce
+    dx, dy, dz = -sa*ce, ca*ce, -se   # points away from camera
+    # project once at unit scale to measure the rotated extent
+    upts = []
+    for x, y, z in verts:
+        X, Y, Z = x-cx, y-cy, z-cz
+        upts.append((X*rx + Y*ry + Z*rz,
+                     X*ux + Y*uy + Z*uz,
+                     X*dx + Y*dy + Z*dz))
+    pxs = [p[0] for p in upts]; pys = [p[1] for p in upts]
+    pspan = max(max(pxs)-min(pxs), max(pys)-min(pys)) or 1.0
+    scale = 0.84 * min(W, H) / pspan
+    ox, oy = W/2, H/2
+    pts = []
+    for u, v, d in upts:
+        pts.append((ox + u*scale, oy - v*scale, d))
+    return pts
+
+def render_solid(wp, size=(700, 560), azim=35, elev=25, bg=(36, 38, 44),
+                 base=(0.30, 0.55, 0.85)):
+    """Render a CadQuery workplane -> PNG bytes (RGBA)."""
+    try:
+        import numpy as np
+    except ImportError:
+        raise RuntimeError("devrender requires numpy")
+    verts, tris = _tessellate(wp)
+    if not tris:
+        raise ValueError("solid has no faces to render")
+    W, H = size
+    pts = _camera(verts, size, azim, elev)
+    # light direction (normalized): from upper-left-front of camera
+    lx, ly, lz = -0.45, 0.55, 0.70
+    norm = math.sqrt(lx*lx + ly*ly + lz*lz)
+    lx, ly, lz = lx/norm, ly/norm, lz/norm
+    img = np.zeros((H, W, 3), dtype=np.float32)
+    img[:, :] = bg
+    zbuf = np.full((H, W), -1e30, dtype=np.float32)
+    for i0, i1, i2 in tris:
+        x0, y0, d0 = pts[i0]; x1, y1, d1 = pts[i1]; x2, y2, d2 = pts[i2]
+        # face normal in model space for lighting
+        ax, ay, az = verts[i1][0]-verts[i0][0], verts[i1][1]-verts[i0][1], verts[i1][2]-verts[i0][2]
+        bx, by, bz = verts[i2][0]-verts[i0][0], verts[i2][1]-verts[i0][1], verts[i2][2]-verts[i0][2]
+        nx, ny, nz = ay*bz-az*by, az*bx-ax*bz, ax*by-ay*bx
+        nl = math.sqrt(nx*nx+ny*ny+nz*nz) or 1.0
+        nx, ny, nz = nx/nl, ny/nl, nz/nl
+        lam = abs(nx*lx + ny*ly + nz*lz)
+        # backface: only render if the projected winding is front-facing
+        area2 = (x1-x0)*(y2-y0) - (x2-x0)*(y1-y0)
+        if area2 <= 0:
+            continue
+        shade = 0.25 + 0.75 * lam
+        r = int(255 * base[0] * shade)
+        g = int(255 * base[1] * shade)
+        b = int(255 * base[2] * shade)
+        # rasterize with barycentric z-test (top-left fill)
+        minx = max(int(math.floor(min(x0, x1, x2))), 0)
+        maxx = min(int(math.ceil(max(x0, x1, x2))), W-1)
+        miny = max(int(math.floor(min(y0, y1, y2))), 0)
+        maxy = min(int(math.ceil(max(y0, y1, y2))), H-1)
+        if minx > maxx or miny > maxy:
+            continue
+        det = area2
+        # vectorized barycentric over the bbox (numpy)
+        ys = np.arange(miny, maxy+1, dtype=np.float32)[:, None]
+        xs = np.arange(minx, maxx+1, dtype=np.float32)[None, :]
+        w1 = ((y2-y0)*(xs-x0) - (x2-x0)*(ys-y0)) / det
+        w2 = ((x1-x0)*(ys-y0) - (y1-y0)*(xs-x0)) / det
+        w0 = 1.0 - w1 - w2
+        mask = (w0 >= -1e-9) & (w1 >= -1e-9) & (w2 >= -1e-9)
+        if not mask.any():
+            continue
+        z = w0*d0 + w1*d1 + w2*d2
+        z = np.where(mask, z, -1e30)
+        sub = zbuf[miny:maxy+1, minx:maxx+1]
+        upd = z > sub
+        sub[upd] = z[upd]
+        region = img[miny:maxy+1, minx:maxx+1]
+        region[upd] = (r, g, b)
+    # encode PNG (RGBA, 8-bit) — minimal writer, no deps
+    return _png_encode(img, W, H)
+
+def _png_encode(img, W, H):
+    """RGB float array -> PNG bytes (zlib)."""
+    import zlib
+    raw = b''
+    im8 = img.astype('uint8')
+    for y in range(H):
+        raw += b'\x00' + im8[y].tobytes()
+    def chunk(tag, data):
+        c = struct.pack('>I', len(data)) + tag + data
+        c += struct.pack('>I', zlib.crc32(tag + data) & 0xffffffff)
+        return c
+    ihdr = struct.pack('>IIBBBBB', W, H, 8, 2, 0, 0, 0)
+    return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr)
+            + chunk(b'IDAT', zlib.compress(raw, 6)) + chunk(b'IEND', b''))
+
+def render_devp(path, **kw):
+    """Load a .devp, rebuild the solid, render it."""
+    import importlib.util, importlib.machinery
+    here = os.path.dirname(os.path.abspath(__file__))
+    loader = importlib.machinery.SourceFileLoader('ipt2devp_mod', os.path.join(here, 'ipt2devp'))
+    spec = importlib.util.spec_from_loader('ipt2devp_mod', loader)
+    m = importlib.util.module_from_spec(spec)
+    loader.exec_module(m)
+    doc = m.load_devp(path)
+    wp = m.devp_to_solid(doc)
+    return render_solid(wp, **kw)
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(description="Deviser 3D renderer")
+    ap.add_argument("devp", help="input .devp (or .ipt via ipt2devp)")
+    ap.add_argument("-o", "--output", default="render.png")
+    ap.add_argument("--azim", type=float, default=35)
+    ap.add_argument("--elev", type=float, default=25)
+    ap.add_argument("--size", default="700x560")
+    args = ap.parse_args()
+    W, H = (int(x) for x in args.size.split('x'))
+    if args.devp.lower().endswith('.ipt'):
+        import importlib.util, importlib.machinery
+        here = os.path.dirname(os.path.abspath(__file__))
+        loader = importlib.machinery.SourceFileLoader('ipt2devp_mod', os.path.join(here, 'ipt2devp'))
+        spec = importlib.util.spec_from_loader('ipt2devp_mod', loader)
+        m = importlib.util.module_from_spec(spec)
+        loader.exec_module(m)
+        wp = m.devp_to_solid(m.make_devp(args.devp))
+        png = render_solid(wp, size=(W, H), azim=args.azim, elev=args.elev)
+    else:
+        png = render_devp(args.devp, size=(W, H), azim=args.azim, elev=args.elev)
+    with open(args.output, 'wb') as f:
+        f.write(png)
+    print(f"rendered {args.output} ({len(png)} bytes)")
+
+if __name__ == "__main__":
+    main()

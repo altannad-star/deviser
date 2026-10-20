@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""devexpr — parametric expression engine for Deviser (Inventor-style).
+
+Evaluates parameter expressions like 'd1*2', 'MyWidth/2 + 3mm', 'd0 * 1.5'
+against a parameter table, with dependency resolution and cycle detection.
+
+Safe evaluator: only arithmetic (+ - * /), numbers, units (mm/cm/deg handled
+by suffix stripping), parens, and named parameters. No eval() of arbitrary
+code — parsed with ast and walked explicitly.
+
+Usage as a module:
+    from devexpr import evaluate, resolve_table
+    v = evaluate("d1*2", {"d0": 1.0, "d1": 2.0})
+    full = resolve_table({"d0": 1.0, "d1": "d0*2", "d2": "d1+1"})  # -> {.., d1:2, d2:3}
+CLI:
+    python3 devexpr 'd1*2' --set d0=1 d1=2.5
+"""
+import ast
+import sys
+import re
+
+_ALLOWED_NODES = (
+    ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant,
+    ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.USub, ast.UAdd,
+)
+
+def _strip_units(text):
+    """Replace unit suffixes with bare numbers (mm stays mm-scale is the
+    caller's business; we treat '3mm' as 3.0 in the table's unit system)."""
+    text = re.sub(r"(\d)\s*mm\b", r"\1", text, flags=re.I)
+    text = re.sub(r"(\d)\s*cm\b", r"\1", text, flags=re.I)
+    text = re.sub(r"(\d)\s*deg\b", r"\1", text, flags=re.I)
+    text = re.sub(r"(\d)\s*ul\b", r"\1", text, flags=re.I)
+    return text
+
+def evaluate(expr, table):
+    """Evaluate an expression string against {name: value-or-expression}."""
+    if isinstance(expr, (int, float)):
+        return float(expr)
+    if not isinstance(expr, str):
+        raise ValueError(f"cannot evaluate {expr!r}")
+    src = _strip_units(expr.strip())
+    if not src:
+        raise ValueError("empty expression")
+    tree = ast.parse(src, mode="eval")
+    return _eval_node(tree.body, table)
+
+def _eval_node(node, table):
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, (int, float)):
+            return float(node.value)
+        raise ValueError(f"constant {node.value!r} not allowed")
+    if isinstance(node, ast.BinOp):
+        l = _eval_node(node.left, table)
+        r = _eval_node(node.right, table)
+        op = type(node.op)
+        if op is ast.Add: return l + r
+        if op is ast.Sub: return l - r
+        if op is ast.Mult: return l * r
+        if op is ast.Div:
+            if r == 0: raise ZeroDivisionError("division by zero in expression")
+            return l / r
+        if op is ast.Pow:
+            if abs(r) > 64: raise ValueError("exponent too large")
+            return l ** r
+        raise ValueError(f"operator {op.__name__} not allowed")
+    if isinstance(node, ast.Name):
+        if node.id not in table:
+            raise ValueError(f"unknown parameter '{node.id}'")
+        v = table[node.id]
+        if isinstance(v, (int, float)):
+            return float(v)
+        return evaluate(v, table)
+    if isinstance(node, ast.UnaryOp):
+        v = _eval_node(node.operand, table)
+        if isinstance(node.op, ast.USub): return -v
+        if isinstance(node.op, ast.UAdd): return v
+        raise ValueError("unary operator not allowed")
+    raise ValueError(f"syntax element {type(node).__name__} not allowed")
+
+def resolve_table(table, max_depth=64):
+    """Resolve a table where values may be expressions referencing others.
+    Returns {name: float}. Raises on cycles or unknown names."""
+    values = {}
+    for k, v in table.items():
+        if isinstance(v, (int, float)):
+            values[k] = float(v)
+    remaining = {k: v for k, v in table.items()
+                 if not isinstance(v, (int, float))}
+    depth = 0
+    while remaining:
+        progress = False
+        for k in list(remaining):
+            expr = remaining[k]
+            names = re.findall(r"[A-Za-z_][A-Za-z_0-9]*", _strip_units(str(expr)))
+            if all(n in values for n in names):
+                values[k] = evaluate(expr, values)
+                del remaining[k]
+                progress = True
+        if not progress:
+            raise ValueError(f"cycle or unknown reference in: {remaining}")
+        depth += 1
+        if depth > max_depth:
+            raise ValueError("expression nesting too deep")
+    return values
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(description="Deviser parametric expression engine")
+    ap.add_argument("expression", help="e.g. 'd1*2 + 3'")
+    ap.add_argument("--set", action="append", default=[],
+                    help="name=value (repeatable); value may be an expression")
+    args = ap.parse_args()
+    table = {}
+    for kv in args.set:
+        name, _, val = kv.partition("=")
+        try:
+            table[name.strip()] = float(val)
+        except ValueError:
+            table[name.strip()] = val
+    resolved = resolve_table(table)
+    print(evaluate(args.expression, resolved))
+
+if __name__ == "__main__":
+    main()

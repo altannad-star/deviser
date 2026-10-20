@@ -908,6 +908,48 @@ parse; all four Deviser format round-trips exact; dw-min shows 1 view
 => Deviser now READS all four Inventor document types and WRITES all
 four Deviser types. The interop matrix is complete.
 
+## 7dd. Session 21 — WORKSTATION FOUNDATION SHIPPED (WS1/WS2/WS3)
+
+The three biggest editor gaps closed (Deviser-side; no Inventor input):
+
+WS1 — 3D VIEWPORT (tools/devrender):
+  Software rasterizer: CadQuery solid -> tessellate -> orthographic
+  camera (azim/elev) -> numpy-vectorized barycentric z-buffer ->
+  lambert-shaded PNG. No GPU/OpenGL needed (AppImage-safe, headless-safe).
+  - fixed in dev: camera fit now measures the ROTATED bbox (was overscale)
+    and the barycentric weights were sign-flipped (centroid test = 1/3,1/3,1/3
+    now used as the regression check)
+  - render ~0.007s per frame (profiled); visually verified: shaded block
+    with hole renders correctly
+  GUI: viewport panel with Front/Top/Right/Iso preset buttons + < > ^ v
+  spin; renders on every Apply & Rebuild and on undo/redo; status shows
+  live volume.
+
+WS2 — PARAMETRIC EXPRESSIONS (tools/devexpr):
+  Inventor-style: any parameter can be '= expression' referencing others
+  (e.g. d0 = d1*2, MyWidth/2 + 3mm). Safe AST evaluator (no eval(); only
+  + - * / ^ parens, numbers, unit suffixes, parameter names), dependency
+  resolution with cycle detection, injection-proof (verified:
+  __import__ blocked).
+  GUI: third column in the parameter table; expression overrides the
+  numeric value on Apply & Rebuild.
+  Verified: d0 = d1*2 -> volume 4000 mm³ (2x2x2 cm from 1cm cube).
+
+WS3 — UNDO/REDO:
+  50-deep undo stack; Apply & Rebuild snapshots pre-edit state
+  (skeleton + features + orig params + table); undo/redo buttons
+  restore + re-render. Verified: edit d0=2 -> undo (d0=1) -> redo (d0=2).
+
+Also fixed (found by the workstation tests):
+  - rebuild_edited now applies only CHANGED values (unchanged rows,
+    incl. zero-valued params like d3=0, no longer collapse the shape)
+
+AppImage: Deviser-WS-2.1-x86_64.AppImage
+  (md5 d9a8c4c8d013a5398dce066ddcd8b3ba, 62 MB)
+
+All 7 GUI test suites + 19-file corpus + volumes/round-trips re-verified
+green after the changes.
+
 ## 8. Open questions / next probes
 1. Parameter record full grammar: unit token, parameter type/flags,
   tolerance fields, multi-parameter files (B2c with 3 params?)

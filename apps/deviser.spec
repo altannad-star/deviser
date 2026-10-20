@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 datas = [('iptinfo', '.'), ('ipt2obj', '.'), ('ipt2step', '.'),
          ('ipt2devp', '.'), ('ipt2deva', '.'), ('ipt2devd', '.'),
-         ('ipt2devx', '.')]
+         ('ipt2devx', '.'), ('devrender', '.'), ('devexpr', '.')]
 binaries = []
 hiddenimports = ['uuid', 're', 'struct', 'datetime', 'argparse', 'json',
                 'webbrowser', 'threading']
