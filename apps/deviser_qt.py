@@ -486,8 +486,12 @@ def run_qt():
             else:
                 self.btn_step.setToolTip("")
 
-            # E1: populate the parameter editor
+            # E1/E3: populate editor + classify features for replay
             self.skeleton, self.orig_params = extract_skeleton(self.ipt)
+            self.features = classify_features(self.orig_params) if self.skeleton else []
+            if self.features:
+                fl = ", ".join(f["op"] for f in self.features)
+                self.info.append(f"Features:    {fl} (will replay on rebuild)")
             self.param_table.setRowCount(0)
             if self.skeleton:
                 sortable = sorted(self.orig_params.items(),
@@ -563,8 +567,12 @@ def run_qt():
                                        getattr(self, "ipt", None))
             try:
                 wp = rebuild_solid(sk)
+                feats = getattr(self, "features", None) or []
+                if feats:
+                    wp = replay_features(wp, feats, sk)
                 vol = wp.val().Volume()
-                self.edit_status.setText(f"Rebuilt ✓  volume: {vol:.2f} mm³  "
+                fdesc = (" + " + ", ".join(f["op"] for f in feats)) if feats else ""
+                self.edit_status.setText(f"Rebuilt ✓{fdesc}  volume: {vol:.2f} mm³  "
                                          f"({wp.val().Faces().__len__()} faces)")
                 self.edited_skeleton = sk
             except Exception as e:
@@ -583,9 +591,16 @@ def run_qt():
             if not p:
                 return
             try:
-                vol = skeleton_to_step(self.edited_skeleton, p)
+                import cadquery as cq
+                sk = self.edited_skeleton
+                wp = rebuild_solid(sk)
+                feats = getattr(self, "features", None) or []
+                if feats:
+                    wp = replay_features(wp, feats, sk)
+                cq.exporters.export(wp, p)
+                vol = wp.val().Volume()
                 QMessageBox.information(
-                    self, "Deviser", f"Exported EDITED solid:\n{p}\nvolume {vol:.2f} mm³")
+                    self, "Deviser", f"Exported EDITED solid{' + features' if feats else ''}:\n{p}\nvolume {vol:.2f} mm³")
             except Exception as e:
                 QMessageBox.critical(self, "Deviser", f"Export failed:\n{e}")
 
