@@ -225,6 +225,49 @@ def _extract_parameters_from_payload(v):
     return legacy
 
 
+# ---------------- E1.5: expression/dependency graph (session 13) ---------------
+
+def _scan_expression_graph(v):
+    """Variable dependency graph: {var: [referenced var names]}.
+
+    Structure (spec session 13): per-variable dependency lists stored as
+    [u32 x][u32 namelen][NAME UTF-16] followed by flagged entries
+    [0x8000|id][u32 len][NAME]... Each variable lists the variables
+    created after it that it may reference. RDxVar* are feature vars.
+    """
+    graph = {}
+    for p in range(0, len(v) - 32, 2):
+        n2 = struct.unpack_from("<I", v, p + 4)[0]
+        if not (2 <= n2 <= 60):
+            continue
+        name_raw = v[p + 8:p + 8 + n2 * 2]
+        if not re.fullmatch(rb"(?:[\x20-\x7e]\x00){%d}" % n2, name_raw):
+            continue
+        name = name_raw.decode("utf-16-le")
+        if not re.match(r"^[A-Za-z][A-Za-z0-9_]*$", name):
+            continue
+        q = p + 8 + n2 * 2
+        refs = []
+        while q + 8 <= len(v):
+            raw = struct.unpack_from("<I", v, q)[0]
+            if raw & 0x80000000:
+                ln = struct.unpack_from("<I", v, q + 4)[0]
+                if 0 < ln <= 40 and q + 8 + ln * 2 <= len(v):
+                    nm = v[q + 8:q + 8 + ln * 2]
+                    if re.fullmatch(rb"(?:[\x20-\x7e]\x00){%d}" % ln, nm):
+                        ref = nm.decode("utf-16-le")
+                        if re.match(r"^[A-Za-z][A-Za-z0-9_]*$", ref):
+                            refs.append(ref)
+                            q += 8 + ln * 2
+                            continue
+                break
+            else:
+                break
+        if refs:
+            graph.setdefault(name, refs)
+    return graph
+
+
 # ---------------- ASM entity stream reader (sessions 6-8) ----------------
 
 ASM_ENTITIES = ("body", "lump", "shell", "face", "loop", "plane", "surface",
@@ -474,6 +517,21 @@ class IptFile:
         return self._params
 
 
+    def parameter_links(self):
+        """E1.5: variable dependency graph {var: [refs]} (or {})."""
+        if not hasattr(self, "_plinks"):
+            self._plinks = {}
+            try:
+                import zstandard
+                for v in _inflate_b_streams(self.ole):
+                    g = _scan_expression_graph(v)
+                    if g:
+                        self._plinks = g
+                        break
+            except Exception:
+                pass
+        return self._plinks
+
     def asm_entities(self):
         """ASM (ACIS-family) entities from the B-rep payload.
 
@@ -512,6 +570,7 @@ class IptFile:
             "file": os.path.basename(self.path),
             "part_title": self.part_title(),
             "parameters": self.parameters(),
+            "parameter_links": self.parameter_links() or None,
             "asm_topology": self.asm_topology_summary() or None,
             "asm_vertices": self.asm_sketch_vertices() or None,
             "author": self.author(),

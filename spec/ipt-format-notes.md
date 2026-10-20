@@ -537,6 +537,25 @@ TOOLING: ipt2step now AUTO-DETECTS the fillet radius from d4+ params
   1mm: volume 991.4159 = 1000 - 4*r^2*(1-pi/4)*h ✓ (faces 10)
   2mm: volume 965.66  ✓ (earlier session; formula now correctly derived)
 
+
+## 7q. Session 13 — E1.5: expression/dependency graph DECODED
+
+The RDxVar0 expression table (found session 12) is now fully decoded:
+- Structure: per-variable DEPENDENCY LISTS:
+  [u32 x][u32 namelen][NAME UTF-16]
+  then flagged entries: [0x8000|id][u32 len][NAME UTF-16]...
+- Semantics: each variable lists the variables created AFTER it
+  (potential references in its expression).
+- 'RDxVar*' = feature variables (fillet radius etc.) depending on dims.
+- Verified across all samples:
+  params.ipt: MyAngle->[MyLength,MyText], MyLength->[MyText]
+  fillet1.ipt: RDxVar0->[d0..d4] (fillet var references sketch dims + its own)
+  cyl/cube/fillet: d-chains as expected
+- TOOLING: iptinfo.parameter_links() returns the graph; included in JSON.
+- E1.5 READY: when a linked.ipt arrives (MyWidth driving a sketch dim),
+  the graph will reveal the d->MyWidth binding; the rebuild engine can
+  then propagate MyWidth edits through d-params to geometry.
+
 ## 8. Open questions / next probes
 1. Parameter record full grammar: unit token, parameter type/flags,
   tolerance fields, multi-parameter files (B2c with 3 params?)
