@@ -145,7 +145,7 @@ def skeleton_from_ipt(ipt):
             fr = extras[0][1] * 10.0
 
     if len(verts) >= 3 and depth > 0:
-        skel = {"type": "prism", "verts_cm": [tuple(v) for v in verts],
+        skel = {"type": "prism", "verts_cm": [[float(x) for x in v] for v in verts],
                 "depth_cm": depth, "fillet_r_mm": fr, "chamfer_mm": 0.0,
                 "holes": [], "depth_param": depth_param,
                 "_orig_params": {k: v for k, v in params.items() if isinstance(v, float)}}
