@@ -63,10 +63,18 @@ def auto_fillet_radius(ipt):
 # ---------------- E1: parameter editing engine ----------------
 import copy
 import re
+import math
 
 def extract_skeleton(ipt):
     """Geometry skeleton + parameter->geometry bindings (E1)."""
-    verts, lines, circles = ipt2obj_mod.extract_geometry(ipt)
+    all_verts, lines, circles = ipt2obj_mod.extract_geometry(ipt)
+    # keep only sketch-plane points (z==0); feature edges add z>0 pts
+    raw = ipt.asm_sketch_vertices()
+    plane = [v for v in raw if abs(float(v[2])) < 1e-9]
+    if len(plane) >= 3:
+        verts = ipt2obj_mod._canonical_polygon(plane)
+    else:
+        verts = all_verts
     radius = ipt2obj_mod.ellipse_radius(ipt)
     depth = ipt2obj_mod.extrude_depth(ipt)
     params = ipt.parameters()
@@ -101,12 +109,25 @@ def extract_skeleton(ipt):
                 break
     elif circles:
         depth_param = "d1"
+    # Feature-param classification (session 14 grammars):
+    # angle params: |v| ~ pi/4 (0.785) = chamfer 45deg; |v| ~ pi/2 (1.571) = hole
+    angles = {k: v for k, v in params.items()
+              if isinstance(v, float) and (abs(abs(v) - math.pi/4) < 0.01 or abs(abs(v) - math.pi/2) < 0.01)}
+    simple_d = sorted((int(k[1:]), v) for k, v in params.items()
+                     if isinstance(k, str) and k.startswith("d") and k[1:].isdigit()
+                     and isinstance(v, float) and 1e-9 < abs(v) < 3.0)
     fr = 0.0
-    for k, v in params.items():
-        if (isinstance(v, float) and k.startswith("d") and k[1:].isdigit()
-                and int(k[1:]) >= 4 and k != depth_param and abs(v) > 1e-9):
-            fr = v * 10.0
-            break
+    if not angles and simple_d:
+        # no angle features: last dN beyond sketch+depth could be a fillet
+        # only when exactly one extra param exists (fillet1: d4 only)
+        sketch_depth_nums = set()
+        if depth_param: sketch_depth_nums.add(int(depth_param[1:]))
+        sketch_depth_nums.update(n for n, _ in simple_d if n <= 3)
+        extras = [(n, v) for n, v in simple_d
+                  if n not in sketch_depth_nums and f"d{n}" != depth_param]
+        if len(extras) == 1:
+            fr = extras[0][1] * 10.0
+
     if len(verts) >= 3 and depth > 0:
         skel = {"type": "prism", "verts_cm": [tuple(v) for v in verts],
                 "depth_cm": depth, "fillet_r_mm": fr, "depth_param": depth_param,
