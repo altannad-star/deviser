@@ -643,6 +643,32 @@ from clean-room-decoded .ipt data, every volume closed-form-exact.
   .ipt -> parse -> classify -> skeleton+features -> edit -> rebuild+replay
   -> save .devp (features persist) -> reopen -> replay -> export STEP
 
+
+## 7v. Session 16 — .iam ASSEMBLY TREE + CONSTRAINT DECODED
+
+The 'Bl2pnvpg' payload contains the assembly BROWSER TREE in the same
+zstd+UTF-16 grammar. Record: [u32 id][u32 namelen][NAME][u32 classLen]
+[CLASS-NAME][flagged refs...]. Decoded from assembly.iam:
+
+  'New Assembly'            -> AmDocEntry          (assembly root)
+  "Engineer's Notebook"    -> NBxNotebook
+  'Constraints'             -> AmConstraintsEntry  (constraint folder)
+  'Origin'                  -> OriginEntryFolder
+  'AmAssemblyFeature'       -> (assembly features folder)
+  'D - simple part:1'       -> AmPartInstEntry     (occurrence #1)
+  'Cyl:1'                   -> AmPartInstEntry     (occurrence #2)
+  'Mate:1'                  -> AmMateEntry         (THE MATE CONSTRAINT)
+  'BRx' (x2, after instances) -> browser ref records
+  7x OriginWorkFeatureEntry  (origin planes/axes)
+  'AmViewRep' + 'Default'   (design views)
+
+=> The .iam structure layer is SOLVED: document tree, part instances
+(with :N instance numbering), mate constraints (AmMateEntry), origin,
+view reps. Combined with session-14b (part refs in payloads + RefdFiles
+storage) the .deva roadmap is: tree ✓, occurrences ✓, constraints ✓,
+transforms (bok3gmb payload has the 3x4 instance matrix: rotation
+(0,0,0/0,0,-1/...) f64s at @1448).
+
 ## 8. Open questions / next probes
 1. Parameter record full grammar: unit token, parameter type/flags,
   tolerance fields, multi-parameter files (B2c with 3 params?)
