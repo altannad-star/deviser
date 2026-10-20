@@ -645,8 +645,8 @@ def run_qt():
 
         def open_file(self):
             p, _ = QFileDialog.getOpenFileName(
-                self, "Choose an Inventor part or assembly", "",
-                "Inventor part/assembly (*.ipt *.iam);;All files (*)")
+                self, "Choose an Inventor document", "",
+                "Inventor documents (*.ipt *.iam *.idw *.ipn);;All files (*)")
             if not p:
                 return
             try:
@@ -656,6 +656,12 @@ def run_qt():
                 return
             if p.lower().endswith(".iam"):
                 self._open_assembly(p)
+                return
+            if p.lower().endswith(".idw"):
+                self._open_drawing(p)
+                return
+            if p.lower().endswith(".ipn"):
+                self._open_presentation(p)
                 return
             self.summary, report = build_report(self.ipt)
             self.info.setPlainText(report)
@@ -894,6 +900,78 @@ def run_qt():
             self.btn_step_edited.setEnabled(HAS_CQ)
             self.btn_devp.setEnabled(True)
             self.edit_status.setText("New part created — edit dims, rebuild, save .devp.")
+
+        def _open_drawing(self, p):
+            """Session 20: .idw drawing view (sheets, views, dims, layers)."""
+            s = self.ipt.summary()
+            dw = s.get("drawing") or {}
+            lines = [f"=== Drawing: {os.path.basename(p)} ===",
+                     f"Title:       {s['part_title']}",
+                     f"Sheets:      {dw.get('sheets')}", ""]
+            views = dw.get("views") or []
+            lines.append(f"Views ({len(views)}):")
+            for v in views:
+                lines.append(f"  - {v['name']}  ->  {v['model']}")
+            dims = dw.get("dimension_texts") or []
+            if dims:
+                lines.append(f"Dimension texts: {dims}")
+            layers = dw.get("layers") or []
+            if layers:
+                lines.append(f"Layers ({len(layers)}): {', '.join(layers[:8])}"
+                             + (" ..." if len(layers) > 8 else ""))
+            params = s.get("parameters") or {}
+            if params:
+                lines.append("")
+                lines.append("Drawing parameters:")
+                for k in sorted(params)[:8]:
+                    lines.append(f"  {k} = {params[k]}")
+            lines.append("")
+            lines.append("(Drawing decode: clean-room, session 20. "
+                         "Use Drawing… to author a .devd from a part.)")
+            self.info.setPlainText("\n".join(lines))
+            png = self.ipt.thumbnail()
+            if png:
+                pm = QPixmap()
+                pm.loadFromData(png)
+                self.thumb.setPixmap(pm.scaled(
+                    340, 340, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            else:
+                self.thumb.setText("(no thumbnail)")
+            self.btn_step.setEnabled(False)
+            self.btn_rebuild.setEnabled(False)
+            self.btn_step_edited.setEnabled(False)
+            self.edit_status.setText("Drawing loaded — views and dims decoded.")
+
+        def _open_presentation(self, p):
+            """Session 20: .ipn presentation view (tree, tweak magnitudes)."""
+            s = self.ipt.summary()
+            pn = s.get("presentation") or {}
+            lines = [f"=== Presentation: {os.path.basename(p)} ===",
+                     f"Title:       {s['part_title']}", ""]
+            tree = pn.get("tree") or []
+            lines.append(f"Explosion tree ({len(tree)}):")
+            for t in tree:
+                lines.append(f"  - {t}")
+            mags = pn.get("tweak_magnitudes_cm") or []
+            if mags:
+                for m in mags:
+                    lines.append(f"Tweak magnitude: {m} cm ({m*10:.4g} mm)")
+            lines.append("")
+            lines.append("(Presentation decode: clean-room, session 20. "
+                         "Use Explosion… to author a .devx from an .iam.)")
+            self.info.setPlainText("\n".join(lines))
+            png = self.ipt.thumbnail()
+            if png:
+                pm = QPixmap()
+                pm.loadFromData(png)
+                self.thumb.setPixmap(pm.scaled(
+                    340, 340, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            else:
+                self.thumb.setText("(no thumbnail)")
+            self.btn_step.setEnabled(False)
+            self.btn_rebuild.setEnabled(False)
+            self.btn_step_edited.setEnabled(False)
+            self.edit_status.setText("Presentation loaded — explosion tree decoded.")
 
         def _open_assembly(self, p):
             """Session 17: .iam assembly view (tree + occurrences + transforms)."""

@@ -768,6 +768,118 @@ class IptFile:
                     break
         return out
 
+        # ---------------- Drawing (.idw) / Presentation (.ipn) readers ----------------
+
+    def _dw_payloads(self):
+        """All inflated B* payloads (session 20): role detection by content."""
+        if not hasattr(self, "_dwp"):
+            self._dwp = []
+            try:
+                import zstandard
+            except ImportError:
+                return self._dwp
+            for entry in self.ole.listdir(streams=True):
+                path = "/".join(entry)
+                if not path.startswith("RSeStorage/B"):
+                    continue
+                v = self.ole.openstream(entry).read()
+                i = v.find(ZSTD_MAGIC)
+                if i < 0:
+                    continue
+                try:
+                    d = zstandard.ZstdDecompressor().decompress(
+                        v[i:], max_output_size=50_000_000)
+                except Exception:
+                    continue
+                self._dwp.append(d)
+        return self._dwp
+
+    def drawing_info(self):
+        """Session 20: decode an .idw drawing."""
+        if not hasattr(self, "_dwinfo"):
+            self._dwinfo = None
+            if not self.path.lower().endswith(".idw"):
+                return self._dwinfo
+            views, dims, notes, layers = [], [], [], []
+            sheets = []
+            for d in self._dw_payloads():
+                for m in re.finditer(rb"V\x00I\x00E\x00W\x00[\x30-\x39]\x00:\x00((?:[\x20-\x7e]\x00)+)", d):
+                    ref = m.group(1).decode("utf-16-le", "ignore")
+                    vname = "VIEW" + chr(d[m.start()+8])
+                    rec = {"name": vname, "model": ref}
+                    if rec not in views:
+                        views.append(rec)
+                if b"S\x00h\x00e\x00e\x00t\x00:\x001\x00" in d:
+                    if "Sheet:1" not in sheets:
+                        sheets.append("Sheet:1")
+                for m in re.finditer(rb"(?:[\x20-\x7e]\x00){2,}", d):
+                    s = m.group().decode("utf-16-le", "ignore")
+                    if re.fullmatch(r"[\x30-\x39]+[.,][\x30-\x39]+", s) and s not in dims:
+                        dims.append(s)
+                    elif re.fullmatch(r"[A-Z]{4,}[\x30-\x39]*", s) and s not in notes:
+                        notes.append(s)
+                for m in re.finditer(rb"[A-Z][a-zA-Z ]+ \(ISO\)", d):
+                    if m.group() not in layers:
+                        layers.append(m.group().decode())
+            if views or dims or notes or layers:
+                self._dwinfo = {
+                    "sheets": sheets,
+                    "views": views,
+                    "dimension_texts": dims,
+                    "notes": notes,
+                    "layers": layers,
+                }
+        return self._dwinfo
+
+    def presentation_info(self):
+        """Session 20: decode an .ipn presentation."""
+        if not hasattr(self, "_pninfo"):
+            self._pninfo = None
+            if not self.path.lower().endswith(".ipn"):
+                return self._pninfo
+            tree, occs, vecs = [], [], []
+            known = ("Presentation1", "Explosion Set", "Scene1",
+                     "Explosion View", "TweakFolder", "Tweaks",
+                     "Tweak:1", "Explosion Part", "Explosion Assembly",
+                     "TweakGroupMember", "New Explosion")
+            for d in self._dw_payloads():
+                for m in re.finditer(rb"(?:[\x20-\x7e]\x00){3,}", d):
+                    s = m.group().decode("utf-16-le", "ignore")
+                    if s in known and s not in tree:
+                        tree.append(s)
+                for m in re.finditer(rb"(?:[\x20-\x7e]\x00)+:(?:[\x20-\x7e]\x00)*[\x30-\x39]\x00", d):
+                    s = m.group().decode("utf-16-le", "ignore")
+                    if re.search(r":[\x30-\x39]+$", s) and s not in occs:
+                        occs.append(s)
+            import struct as _s
+            for d in self._dw_payloads():
+                if len(d) > 100_000 or b"T\x00w\x00e\x00a\x00k" not in d:
+                    continue
+                # tweak offset record (session 20 ground truth):
+                #   [u32 1][f64 magnitude_cm]  (25 mm tweak = 2.5 cm)
+                # direction is stored in the tweak transform elsewhere;
+                # the magnitude is the distinctive part.
+                pat = b"\x01\x00\x00\x00"
+                off = d.find(pat)
+                while off >= 0 and off + 12 <= len(d):
+                    try:
+                        val = _s.unpack_from("<d", d, off + 4)[0]
+                    except Exception:
+                        val = None
+                    if (val is not None and val == val
+                            and 0.05 <= abs(val) <= 50.0
+                            and abs(val * 100 - round(val * 100)) < 1e-6
+                            and val not in vecs):
+                        vecs.append(val)
+                    off = d.find(pat, off + 1)
+            if tree or vecs:
+                self._pninfo = {
+                    "tree": tree,
+                    "occurrences": occs,
+                    "tweak_magnitudes_cm": vecs,
+                }
+        return self._pninfo
+
     def summary(self):
         s = {
             "file": os.path.basename(self.path),
@@ -779,6 +891,8 @@ class IptFile:
             "assembly_tree": self.assembly_tree() or None,
             "occurrences": self.occurrences() or None,
             "placed_transform": self.placed_transform(),
+            "drawing": self.drawing_info(),
+            "presentation": self.presentation_info(),
             "author": self.author(),
             "inventor_build": self.inventor_build(),
             "material": self.material(),
@@ -807,6 +921,19 @@ def print_human(s):
     if placed:
         for t in placed:
             print(f"  Placed transform: {[round(v, 4) for v in t]}")
+    dw = s.get('drawing')
+    if dw:
+        print(f"  Drawing sheets:   {dw.get('sheets')}")
+        for v in dw.get('views', []):
+            print(f"  Drawing view:     {v['name']} -> {v['model']}")
+        print(f"  Dim texts:        {dw.get('dimension_texts')}")
+        print(f"  Layers:           {len(dw.get('layers', []))}")
+    pn = s.get('presentation')
+    if pn:
+        print(f"  Explosion tree:   {' / '.join(pn.get('tree', [])[:6])}...")
+        mags = pn.get('tweak_magnitudes_cm')
+        if mags:
+            print(f"  Tweak magnitudes: {mags} cm")
     tree = s.get('assembly_tree')
     if tree:
         print(f"  Browser filters ({len(tree)}):")

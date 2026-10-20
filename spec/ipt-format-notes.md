@@ -874,6 +874,40 @@ Diff highlights (min vs annot/explode):
 => The .devd/.devx formats (session 19) already model these layers;
   .idw/.ipn READ interop is now a mapping exercise, not a mystery.
 
+## 7cc. Session 20b — .idw/.ipn READERS SHIPPED (iptinfo + GUI)
+
+iptinfo now decodes .idw and .ipn natively (drawing_info() /
+presentation_info(), both .idw/.ipn-scoped like the .iam decoders):
+
+.idw drawing_info():
+  sheets ['Sheet:1']; views[] with name + explicit model ref
+  (VIEW1/2/3 -> 'D - simple part.ipt', UTF16 record
+  'V\0I\0E\0W\0<d>\0:\0<model>'); dimension_texts[] ('10,00',
+  Danish decimal comma); notes[] (DEVISERTEST found); ISO layers.
+  Bonus: the bd0b parameter reader picks up drawing params from the
+  payload (Sheet number=1, RDxVar17/18, d0/d1 = sheet-space extents).
+
+.ipn presentation_info():
+  tree[]: the full 11-node explosion tree (Presentation1/Explosion
+  Set/Scene1/Explosion View/Explosion Assembly/TweakFolder/Explosion
+  Part/Tweak:1/Tweaks/TweakGroupMember/New Explosion);
+  tweak_magnitudes_cm[]: [u32 1][f64 magnitude] records — the 25 mm
+  tweak reads back as 2.5 cm exactly; pn-min returns [] (no tweaks).
+
+GUI (AppImage S20-2.0, md5 454f098a72f623fe58bf2e547f7d527c):
+  Open .idw -> drawing view (sheets, views+model refs, dim texts,
+  layers, drawing parameters)
+  Open .ipn -> presentation view (explosion tree, tweak magnitudes
+  in cm and mm)
+  All prior features regression-verified.
+
+Verification: 20/20 corpus files (parts+assembly+drawing+presentation)
+parse; all four Deviser format round-trips exact; dw-min shows 1 view
+(no annots), dw-annot shows 3 views + dims.
+
+=> Deviser now READS all four Inventor document types and WRITES all
+four Deviser types. The interop matrix is complete.
+
 ## 8. Open questions / next probes
 1. Parameter record full grammar: unit token, parameter type/flags,
   tolerance fields, multi-parameter files (B2c with 3 params?)
