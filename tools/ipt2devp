@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""devp — Deviser native part format (.devp) reader/writer.
+
+Format design (E2):
+  .devp = zstd-compressed JSON document
+
+  {
+    "format": "devp",
+    "version": 1,
+    "units": "mm",                     # canonical display units
+    "part": {"title": "...", "author": "...", "material": {...}},
+    "parameters": {"d0": 1.0, ...},     # cm values internally (as read from .ipt)
+    "skeleton": {                        # the geometry skeleton (E1 engine)
+      "type": "prism"|"cylinder",
+      "verts_cm": [[x,y],...] ,         # prism path
+      "center_cm": [x,y], "radius_cm": r,  # cylinder
+      "depth_cm": h,
+      "fillet_r_mm": r,                 # fillet feature (0 = none)
+      "chamfer_mm": c,                  # chamfer feature (0 = none, E3.5)
+      "holes": [{"center_mm":[x,y], "r_mm": r, "depth": "through"|"mm", "d_mm": d}]
+    },
+    "history": [                         # feature history (ordered, replayable)
+      {"op": "sketch", "shape": "rect"|"circle", ...},
+      {"op": "extrude", "depth_cm": h},
+      {"op": "fillet", "r_mm": r},
+      {"op": "chamfer", "mm": c}
+    ],
+    "provenance": {"source": "ipt", "original_file": "cyl.ipt"}
+  }
+
+Why zstd+JSON: forward-compatible (unknown keys tolerated), inspectable
+(zstdcat file.devp | jq), matches our RSe findings (Inventor itself uses
+zstd). Clean-room by construction.
+"""
+import json
+import struct
+import sys
+import os
+
+MAGIC = b"DEVP"
+VERSION = 1
+
+try:
+    import zstandard as zstd
+except ImportError:
+    sys.stderr.write("devp format requires: pip install zstandard\n")
+    sys.exit(2)
+
+import importlib.util
+import importlib.machinery
+
+def _load(name, target):
+    here = os.path.dirname(os.path.abspath(__file__))
+    for p in (os.path.join(here, name),
+              os.path.join(getattr(sys, "_MEIPASS", here), name)):
+        if os.path.exists(p):
+            loader = importlib.machinery.SourceFileLoader(target, p)
+            spec = importlib.util.spec_from_loader(target, loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            return mod
+    raise RuntimeError(f"module {name} not found")
+
+iptinfo = _load("iptinfo", "iptinfo")
+ipt2obj = _load("ipt2obj", "ipt2obj_mod")
+
+
+def skeleton_from_ipt(ipt):
+    """Extract the E1 geometry skeleton + params from an open .ipt."""
+    import copy
+    verts, lines, circles = ipt2obj.extract_geometry(ipt)
+    radius = ipt2obj.ellipse_radius(ipt)
+    depth = ipt2obj.extrude_depth(ipt)
+    params = ipt.parameters()
+    fr = 0.0
+    depth_param = None
+    dnums = sorted(int(k[1:]) for k in params
+                   if isinstance(k, str) and k.startswith("d") and k[1:].isdigit()
+                   and isinstance(params[k], float))
+    if len(verts) >= 3:
+        dc = [n for n in dnums if 2 <= n < 4]
+        depth_param = f"d{dc[0]}" if dc else None
+    elif circles:
+        depth_param = "d1"
+    for k, v in params.items():
+        if isinstance(v, float) and k.startswith("d") and k[1:].isdigit() and int(k[1:]) >= 4:
+            fr = v * 10.0
+            break
+    if len(verts) >= 3 and depth > 0:
+        return {"type": "prism",
+                "verts_cm": [[v[0], v[1]] for v in verts],
+                "depth_cm": depth, "fillet_r_mm": fr, "chamfer_mm": 0.0,
+                "holes": [], "depth_param": depth_param}, params
+    elif circles and radius:
+        return {"type": "cylinder",
+                "center_cm": [circles[0][0][0], circles[0][0][1]],
+                "radius_cm": radius, "depth_cm": depth,
+                "fillet_r_mm": fr, "chamfer_mm": 0.0,
+                "holes": [], "depth_param": depth_param}, params
+    return None, params
+
+
+def make_devp(ipt_path):
+    """Build a .devp document dict from an .ipt file."""
+    with iptinfo.IptFile(ipt_path) as ipt:
+        s = ipt.summary()
+        skeleton, params = skeleton_from_ipt(ipt)
+        params_clean = {k: v for k, v in params.items() if isinstance(v, (int, float, str))}
+        doc = {
+            "format": "devp",
+            "version": VERSION,
+            "units": "mm",
+            "part": {
+                "title": s["part_title"],
+                "author": s["author"],
+                "material": s.get("material", {}),
+                "inventor_build": s.get("inventor_build"),
+            },
+            "parameters": params_clean,
+            "skeleton": skeleton,
+            "history": _history_from_skeleton(skeleton),
+            "provenance": {"source": "ipt", "original_file": os.path.basename(ipt_path)},
+        }
+    return doc
+
+
+def _history_from_skeleton(sk):
+    """Derive a replayable feature history from a skeleton."""
+    if not sk:
+        return []
+    h = []
+    if sk["type"] == "prism":
+        h.append({"op": "sketch", "shape": "polygon",
+                  "verts_cm": sk["verts_cm"]})
+    else:
+        h.append({"op": "sketch", "shape": "circle",
+                  "center_cm": sk["center_cm"], "radius_cm": sk["radius_cm"]})
+    h.append({"op": "extrude", "depth_cm": sk["depth_cm"]})
+    if sk.get("fillet_r_mm", 0) > 0:
+        h.append({"op": "fillet", "r_mm": sk["fillet_r_mm"]})
+    if sk.get("chamfer_mm", 0) > 0:
+        h.append({"op": "chamfer", "mm": sk["chamfer_mm"]})
+    for hole in sk.get("holes", []):
+        h.append({"op": "hole", **hole})
+    return h
+
+
+def save_devp(doc, path):
+    """Write a .devp file: MAGIC + u16 version + zstd(JSON)."""
+    payload = json.dumps(doc, indent=1, default=str).encode()
+    packed = zstd.ZstdCompressor(level=19).compress(payload)
+    with open(path, "wb") as f:
+        f.write(MAGIC)
+        f.write(struct.pack("<H", doc.get("version", VERSION)))
+        f.write(packed)
+    return os.path.getsize(path)
+
+
+def load_devp(path):
+    """Read a .devp file -> doc dict. Validates magic and version."""
+    with open(path, "rb") as f:
+        head = f.read(6)
+        if len(head) < 6 or head[:4] != MAGIC:
+            raise ValueError("not a .devp file (bad magic)")
+        ver = struct.unpack("<H", head[4:6])[0]
+        if ver > VERSION:
+            raise ValueError(f"devp v{ver} newer than supported v{VERSION}")
+        packed = f.read()
+    payload = zstd.ZstdDecompressor().decompress(packed, max_output_size=10_000_000)
+    doc = json.loads(payload.decode())
+    if doc.get("format") != "devp":
+        raise ValueError("devp doc missing format tag")
+    return doc
+
+
+def devp_to_solid(doc):
+    """Rebuild the solid from a .devp document (via OpenCascade)."""
+    sk = doc["skeleton"]
+    return skeleton_to_solid(sk)
+
+
+def skeleton_to_solid(sk):
+    import cadquery as cq
+    S = 10.0
+    if sk["type"] == "cylinder":
+        wp = (cq.Workplane("XY")
+              .center(sk["center_cm"][0]*S, sk["center_cm"][1]*S)
+              .circle(sk["radius_cm"]*S)
+              .extrude(sk["depth_cm"]*S))
+    else:
+        wp = (cq.Workplane("XY")
+              .polyline([(v[0]*S, v[1]*S) for v in sk["verts_cm"]])
+              .close().extrude(sk["depth_cm"]*S))
+    if sk.get("fillet_r_mm", 0) > 0:
+        wp = wp.edges("|Z").fillet(sk["fillet_r_mm"])
+    if sk.get("chamfer_mm", 0) > 0:
+        wp = wp.edges("|Z").chamfer(sk["chamfer_mm"])
+    for hole in sk.get("holes", []):
+        c = hole["center_mm"]
+        wp = wp.faces(">Z").workplane() \
+            .center(c[0], c[1]) \
+            .hole(hole["r_mm"]*2)
+    return wp
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(description="Deviser .devp format tool")
+    ap.add_argument("ipt_file", help="input .ipt to convert")
+    ap.add_argument("-o", "--output", help="output .devp path")
+    ap.add_argument("--export-step", help="also rebuild solid -> STEP")
+    args = ap.parse_args()
+    out = args.output or (args.ipt_file.rsplit(".", 1)[0] + ".devp")
+    doc = make_devp(args.ipt_file)
+    size = save_devp(doc, out)
+    print(f"wrote {out} ({size} bytes, devp v{VERSION})")
+    if args.export_step:
+        sp = args.export_step
+        wp = devp_to_solid(doc)
+        import cadquery as cq
+        cq.exporters.export(wp, sp)
+        print(f"rebuilt solid -> {sp} (volume {wp.val().Volume():.2f} mm^3)")
+
+
+if __name__ == "__main__":
+    main()

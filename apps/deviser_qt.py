@@ -34,6 +34,10 @@ def load_module(name, target):
 iptinfo = load_module("iptinfo", "iptinfo")
 ipt2obj_mod = load_module("ipt2obj", "ipt2obj_mod")
 IptFile = iptinfo.IptFile
+try:
+    ipt2devp_mod = load_module("ipt2devp", "ipt2devp_mod")
+except Exception:
+    ipt2devp_mod = None
 
 try:
     import cadquery as cq
@@ -212,10 +216,12 @@ def run_qt():
 
             top = QHBoxLayout()
             btn_open = QPushButton("Open .ipt…")
+            btn_open_devp = QPushButton("Open .devp…")
+            btn_devp = QPushButton("Save .devp…")
             btn_obj = QPushButton("Export OBJ…")
             btn_step = QPushButton("Export STEP…")
             btn_json = QPushButton("Save JSON…")
-            for b in (btn_open, btn_obj, btn_step, btn_json):
+            for b in (btn_open, btn_open_devp, btn_devp, btn_obj, btn_step, btn_json):
                 top.addWidget(b)
             lbl = QLabel("clean-room · no Autodesk code")
             top.addStretch()
@@ -259,6 +265,8 @@ def run_qt():
             root.addWidget(edit_group)
 
             btn_open.clicked.connect(self.open_file)
+            btn_open_devp.clicked.connect(self.open_devp)
+            btn_devp.clicked.connect(self.save_devp)
             btn_obj.clicked.connect(self.export_obj)
             btn_step.clicked.connect(self.export_step)
             btn_json.clicked.connect(self.export_json)
@@ -391,6 +399,99 @@ def run_qt():
                     self, "Deviser", f"Exported EDITED solid:\n{p}\nvolume {vol:.2f} mm³")
             except Exception as e:
                 QMessageBox.critical(self, "Deviser", f"Export failed:\n{e}")
+
+        def open_devp(self):
+            if ipt2devp_mod is None:
+                QMessageBox.warning(self, "Deviser", ".devp module unavailable")
+                return
+            p, _ = QFileDialog.getOpenFileName(
+                self, "Open Deviser part", "", "Deviser part (*.devp);;All files (*)")
+            if not p:
+                return
+            try:
+                doc = ipt2devp_mod.load_devp(p)
+            except Exception as e:
+                QMessageBox.critical(self, "Deviser", f"Cannot open .devp:\n{e}")
+                return
+            self.devp_doc = doc
+            self.devp_path = p
+            sk = doc.get("skeleton") or {}
+            lines = [f"Deviser part (.devp v{doc['version']}): {p}",
+                     f"Title:       {doc['part']['title']}",
+                     f"Author:      {doc['part'].get('author')}"]
+            params = doc.get("parameters", {})
+            for k in sorted(params):
+                lines.append(f"Parameter:   {k} = {params[k]}")
+            lines.append(f"Type:        {sk.get('type')}")
+            lines.append(f"History:     " + " -> ".join(h["op"] for h in doc.get("history", [])))
+            self.info.setPlainText("\n".join(lines))
+            self.thumb.setText("(native format — no thumbnail)")
+            # populate editor from the skeleton
+            self.param_table.setRowCount(0)
+            if sk:
+                self.skeleton = dict(sk)
+                self.skeleton.setdefault("chamfer_mm", 0.0)
+                self.skeleton.setdefault("holes", [])
+                for name in sorted(params):
+                    val = params[name]
+                    if not isinstance(val, (int, float)):
+                        continue
+                    row = self.param_table.rowCount()
+                    self.param_table.insertRow(row)
+                    self.param_table.setItem(row, 0, QTableWidgetItem(str(name)))
+                    sb = QDoubleSpinBox()
+                    sb.setDecimals(4)
+                    sb.setRange(-10000.0, 10000.0)
+                    sb.setValue(float(val))
+                    self.param_table.setCellWidget(row, 1, sb)
+                self.btn_rebuild.setEnabled(True)
+                self.btn_step_edited.setEnabled(HAS_CQ)
+                self.edit_status.setText("Opened .devp — edit, rebuild, save back.")
+
+        def save_devp(self):
+            if ipt2devp_mod is None:
+                QMessageBox.warning(self, "Deviser", ".devp module unavailable")
+                return
+            if getattr(self, "skeleton", None) is None:
+                QMessageBox.information(self, "Deviser", "Load an .ipt or .devp first.")
+                return
+            # gather current edits into the doc
+            if getattr(self, "devp_doc", None) is None:
+                # build a fresh doc from current state
+                self.devp_doc = {
+                    "format": "devp", "version": 1, "units": "mm",
+                    "part": {"title": self.summary["part_title"] if self.summary else "Deviser part",
+                             "author": "", "material": {}},
+                    "parameters": {},
+                    "skeleton": None,
+                    "history": [],
+                    "provenance": {"source": "deviser"},
+                }
+            doc = self.devp_doc
+            # apply table edits (params dict + skeleton edits like rebuild)
+            sk = copy.deepcopy(self.skeleton)
+            for row in range(self.param_table.rowCount()):
+                name_item = self.param_table.item(row, 0)
+                sb = self.param_table.cellWidget(row, 1)
+                if name_item is None or sb is None:
+                    continue
+                name, val = name_item.text(), sb.value()
+                doc["parameters"][name] = val
+                sk = apply_edit(sk, name, val)
+            doc["skeleton"] = sk
+            doc["history"] = ipt2devp_mod._history_from_skeleton(sk)
+            default = getattr(self, "devp_path", None) or (
+                os.path.splitext(self.ipt.path)[0] + ".devp" if getattr(self, "ipt", None) else "part.devp")
+            p, _ = QFileDialog.getSaveFileName(self, "Save Deviser part", default,
+                                                "Deviser part (*.devp)")
+            if not p:
+                return
+            try:
+                size = ipt2devp_mod.save_devp(doc, p)
+                self.devp_path = p
+                QMessageBox.information(self, "Deviser", f"Saved:\n{p} ({size} bytes)")
+            except Exception as e:
+                QMessageBox.critical(self, "Deviser", f"Save failed:\n{e}")
 
         def export_json(self):
             if not self._loaded():
