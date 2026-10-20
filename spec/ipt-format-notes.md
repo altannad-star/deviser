@@ -821,6 +821,59 @@ view lists constraints with their classes. Round-trips still exact.
 AppImage: Deviser-16c-1.9-x86_64.AppImage
   (md5 80b7a4631bbd58bbc88d503252b5821e, 62 MB)
 
+## 7bb. Session 20 — .idw DRAWING + .ipn PRESENTATION DECODED (batch3)
+
+Ground truth: batch3 (user-made, shipped 2026-10-20):
+  dw-min.idw / dw-annot.idw (2-3 dims, DEVISERTEST note, projected views)
+  pn-min.ipn / pn-explode.ipn (one tweak: 25 mm straight up in Z)
+
+CONTAINER: both .idw and .ipn are the same OLE/CFB + RSeStorage(zstd)
+family as .ipt/.iam — the entire Inventor document-type matrix shares
+one container.
+
+.idw stream roles (roles detected by content, names are per-file random):
+  Browser-tree payload (~3.7KB): 'Drawing' root, 'Sheet:1' (Sheet),
+    'Drawing Resources', Borders/Title Blocks/Sketched Symbols folders,
+    'Default Border' (Drawing Border), 'Title Block', and view records:
+    VIEW1/VIEW2/VIEW3 'View' with refs ':D - simple part.ipt' —
+    the view→model link is explicit. UCx*DrawingBrowserFilter classes.
+  Views payload (~3.8KB): VIEW1/2/3 records + text elements:
+    '10,00' (dimension text, Danish decimal comma!) and 'DEVISERTEST'
+    (the note). Sheet-space positions as f64 (cm), e.g. 22.0192.
+  Sheet geometry payload (~23KB): RDxVar0..RDxVar18 records (drawing
+    variables), model path 'P:\...\D - simple part.ipt', view scale
+    labels 'VIEW1 ( 5 : 1 )' (scale 5:1), 'LinearDimension',
+    'ViewScaleLabel' entity classes, DEVISERTEST with text-format
+    escapes '\F33;DEVISERTEST'.
+  Layers payload: full ISO layer table (Visible/Hidden/Dimension/
+    Centerline/Hatch/Section Line... + '1:' numbered variants).
+  Title block payload: 'Designed by / Checked by / Approved by / Date /
+    Edition / Sheet', values dw-annot / 2ndlo / 20-10-2026 / '1 / 1'.
+  Big B* payload (~400KB inflated): view graphics cache.
+
+.ipn stream roles:
+  Explosion tree payload (Bdrnjwf, ~1.1KB): full presentation tree:
+    'Presentation1' root (DxHierarchy), 'Explosion Set' (Explosion),
+    'Scene1' (Explosion View), 'Assembly.iam' (Explosion Assembly),
+    'TweakFolder' (Tweaks), 'D - simple part:1' + 'Cyl:1' (Explosion
+    Part), 'Tweak:1' (TweakGroupMember) — tweak→occurrence mapping
+    is explicit: 'Cyl:1' appears as Tweak:1's member.
+  Scene/graphics payload (Bxiwy, ~8.6KB): 'New Explosion' (Explosion),
+    Scene1/Default, Default Lights, materials — AND the tweak vector:
+    f64 run [0, 0, 0, 0, 2.5(cm)] = 25 mm along Z, the exact tweak
+    the user applied.
+  Publications payload (Boopvv): PUBxDocData/PUBxPersistData XML-ish
+    records (PersistObjects, RefCountMapData).
+
+Diff highlights (min vs annot/explode):
+  .idw: views payload 588->3783 bytes (dims+note added); sheet
+    geometry 11K->23K; V1/RSeDb vs V2/RSeDb (revision bump).
+  .ipn: explosion tree 876->1124 (Tweak:1 + member); scene 6888->8638
+    (tweak vector); graphics cache 166K->217K.
+
+=> The .devd/.devx formats (session 19) already model these layers;
+  .idw/.ipn READ interop is now a mapping exercise, not a mystery.
+
 ## 8. Open questions / next probes
 1. Parameter record full grammar: unit token, parameter type/flags,
   tolerance fields, multi-parameter files (B2c with 3 params?)
