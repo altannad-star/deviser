@@ -299,6 +299,142 @@ def _find_asm_payload(ole):
     return None
 
 
+# ---------------- Assembly (.iam) decoders (sessions 16-16b) ----------------
+
+def _assembly_payload(ole):
+    """Return all decompressed RSeStorage/B* payloads that carry the
+    assembly browser-tree grammar (class names like AmDocEntry)."""
+    try:
+        import zstandard
+    except ImportError:
+        return []
+    out = []
+    for entry in ole.listdir(streams=True):
+        path = "/".join(entry)
+        if not path.startswith("RSeStorage/B"):
+            continue
+        v = ole.openstream(entry).read()
+        i = v.find(ZSTD_MAGIC)
+        if i < 0:
+            continue
+        try:
+            d = zstandard.ZstdDecompressor().decompress(v[i:], max_output_size=50_000_000)
+        except Exception:
+            continue
+        out.append(d)
+    return out
+
+def _read_tree_entries(payload):
+    """Parse the browser-tree record grammar (session 16):
+        [u32 namelen][UTF16 name][u32 classlen][ASCII class name][refs...]
+      Names are pure-ASCII UTF16. Records sit on 16-byte framing.
+    """
+    entries = []
+    pos = 0
+    b = payload
+    n = len(b)
+    while pos + 8 <= n:
+        if b[pos:pos+4] == b"\x00\x00\x00\x00" and (pos % 16) == 0:
+            pos += 4
+            continue
+        nl = struct.unpack_from("<I", b, pos)[0]
+        if 1 <= nl <= 256 and pos + 4 + nl * 2 <= n:
+            raw = b[pos+4:pos+4+nl*2]
+            if (all(raw[i] < 0x80 for i in range(0, len(raw), 2))
+                    and all(raw[i] == 0 for i in range(1, len(raw), 2))
+                    and 0x20 <= raw[0] < 0x7f):
+                name = raw.decode("utf-16-le")
+                p2 = pos + 4 + nl * 2
+                cl = struct.unpack_from("<I", b, p2)[0] if p2 + 4 <= n else -1
+                if 1 <= cl <= 128 and p2 + 4 + cl <= n:
+                    cls = b[p2+4:p2+4+cl]
+                    if all(0x20 <= c < 0x7f for c in cls):
+                        entries.append({"name": name, "class": cls.decode("latin1"), "offset": pos})
+                        pos = p2 + 4 + cl
+                        continue
+        pos += 1
+    return entries
+
+def _utf16_ascii_name(b, p):
+    """Return (name, next_pos) when a plausible record name sits at p,
+    else (None, p). Record names here are pure-ASCII UTF16; the consumer
+    must reject binary records that only look like names."""
+    n = len(b)
+    nl = struct.unpack_from("<I", b, p)[0]
+    if not (2 <= nl <= 256) or p + 4 + nl * 2 > n:
+        return None, p
+    raw = b[p+4:p+4+nl*2]
+    if not all(raw[i] < 0x80 and 0x20 <= raw[i] for i in range(0, len(raw), 2)):
+        return None, p
+    if not all(raw[i] == 0 for i in range(1, len(raw), 2)):
+        return None, p
+    return raw.decode("utf-16-le"), p + 4 + nl * 2
+
+def _read_occurrence_records(payload):
+    """Parse the occurrence/transform layer (session 16b).
+    The payload reuses the ASM token stream plus occurrence records:
+        [flags 02 00 00 30][u32 namelen][UTF16 name] ...
+    plus inline f64 runs: identity or placed 3x4 transform matrices
+    (row-major 12 doubles + trailing 0), GUIDs (16 bytes), and
+    small-int parameter runs. The interesting matrix is the run that
+    is neither all-zero nor the identity. Returns occurrences with
+    name and 3x4 transform when one can be attributed.
+    """
+    occs = []
+    b = payload
+    n = len(b)
+    pos = 0
+    while pos + 12 <= n:
+        if (b[pos] == 0x02 and b[pos+1] == 0x00 and b[pos+2] == 0x00 and b[pos+3] == 0x30):
+            # [02 00 00 30][u32 0][u32 namelen][UTF16 name]
+            name, nxt = _utf16_ascii_name(b, pos + 8)
+            if name is not None:
+                occs.append({"name": name, "offset": pos, "transform": None})
+                pos = nxt
+                continue
+        pos += 1
+    return occs
+
+def _plausible_transform(vals):
+    """A 13-double 0x42-tagged window: 12 transform doubles + trailing
+    0. Accepted when all values are finite and within unit scale (these are
+    axis-permutation placements: exact 0/+-1 entries in ground truth)."""
+    if any(v != v for v in vals):
+        return False
+    if len(vals) >= 12 and max(abs(v) for v in vals[:12]) > 1.5:
+        return False
+    return len(vals) >= 12
+
+def _scan_transforms(payload, occurrences):
+    """Find occurrence transforms in the payload. Session 16b ground truth
+    (assembly.iam): transforms are tagged '00 80 42 00' followed by 13
+    doubles (12 transform values + trailing 0). The placed occurrence
+    (Cyl:1, a 90-degree placement) carries a -1 z-entry; identity-placed
+    occurrences carry zeros/identity. Per-occurrence attribution needs a
+    translated sample, so all tagged windows are reported per-document."""
+    b = payload
+    tag = b"\x00\x80\x42\x00"
+    out = []
+    i = 0
+    while True:
+        i = b.find(tag, i)
+        if i < 0:
+            break
+        base = i + 4
+        if base + 104 <= len(b):
+            vals = list(struct.unpack_from("<13d", b, base))
+            if _plausible_transform(vals):
+                out.append(vals[:12])
+        i += 1
+    for occ in occurrences:
+        occ["transform"] = None
+    placed = [t for t in out if not _is_identity(t)]
+    return placed
+
+def _is_identity(vals):
+    """Identity or all-zero (unplaced) transform: nothing to report."""
+    return all(abs(v) < 1e-9 for v in vals)
+
 def _read_asm_entities(payload):
     """Parse the ASM binary entity stream -> list of entity dicts.
 
@@ -550,6 +686,47 @@ class IptFile:
         c = Counter(e["type"] for e in self.asm_entities())
         return dict(c)
 
+    def assembly_tree(self):
+        """Session 16: browser-tree entries [{name, class, offset}] from
+        the .iam Bl2pnvpg-family payload. Empty for plain .ipt parts."""
+        if not hasattr(self, "_amtree"):
+            self._amtree = []
+            if self.path.lower().endswith(".iam"):
+                for v in _assembly_payload(self.ole):
+                    ents = _read_tree_entries(v)
+                    if len(ents) > len(self._amtree):
+                        self._amtree = ents
+                        self._amtree_payload = v
+        return self._amtree
+
+    def occurrences(self):
+        """Session 16b: [{name, transform}] occurrence records from the
+        .iam occurrence payload (names + the placed transform, which is
+        reported per-document via placed_transform())."""
+        if not hasattr(self, "_occs"):
+            self._occs = []
+            best = []
+            best_payload = None
+            if self.path.lower().endswith(".iam"):
+                for v in _assembly_payload(self.ole):
+                    occs = _read_occurrence_records(v)
+                    if len(occs) > len(best):
+                        best = occs
+                        best_payload = v
+            if best:
+                self._placed = _scan_transforms(best_payload, best)
+                self._occs = best
+        return self._occs
+
+    def placed_transform(self):
+        """All non-identity 0x42-tagged 12-double transform windows found
+        in the occurrence payload (raw values; row/column-major semantics
+        pending one more ground-truth sample)."""
+        if not hasattr(self, "_placed"):
+            self._placed = []
+            self.occurrences()
+        return self._placed
+
     def asm_sketch_vertices(self):
         """Decoded point-entity coordinates (the explicit base topology).
 
@@ -566,13 +743,16 @@ class IptFile:
         return out
 
     def summary(self):
-        return {
+        s = {
             "file": os.path.basename(self.path),
             "part_title": self.part_title(),
             "parameters": self.parameters(),
             "parameter_links": self.parameter_links() or None,
             "asm_topology": self.asm_topology_summary() or None,
             "asm_vertices": self.asm_sketch_vertices() or None,
+            "assembly_tree": self.assembly_tree() or None,
+            "occurrences": self.occurrences() or None,
+            "placed_transform": self.placed_transform(),
             "author": self.author(),
             "inventor_build": self.inventor_build(),
             "material": self.material(),
@@ -584,7 +764,7 @@ class IptFile:
             "thumbnail_png": len(self._thumb) if self._thumb else None,
             "properties": self.all_properties(),
         }
-
+        return s
 
 def print_human(s):
     print(f"=== {s['file']} ===")
@@ -592,6 +772,20 @@ def print_human(s):
     if s.get('parameters'):
         for name, val in s['parameters'].items():
             print(f"  Parameter:        {name} = {val}")
+    occs = s.get('occurrences')
+    if occs:
+        print(f"  Assembly tree ({len(occs)} entries):")
+        for o in occs:
+            print(f"    - {o['name']}")
+    placed = s.get('placed_transform')
+    if placed:
+        for t in placed:
+            print(f"  Placed transform: {[round(v, 4) for v in t]}")
+    tree = s.get('assembly_tree')
+    if tree:
+        print(f"  Browser filters ({len(tree)}):")
+        for e in tree:
+            print(f"    - {e['name']} [{e['class']}")
     print(f"  Author:           {s['author']}")
     print(f"  Inventor build:   {s['inventor_build']}")
     m = s["material"]

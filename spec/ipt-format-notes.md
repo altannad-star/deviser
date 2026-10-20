@@ -669,6 +669,40 @@ storage) the .deva roadmap is: tree ✓, occurrences ✓, constraints ✓,
 transforms (bok3gmb payload has the 3x4 instance matrix: rotation
 (0,0,0/0,0,-1/...) f64s at @1448).
 
+## 7w. Session 16b — .iam OCCURRENCE RECORDS + TRANSFORMS DECODED
+
+The 'Bbok3gmb' payload (6755 bytes) carries the occurrence/transform layer.
+Two grammars identified:
+
+OCCURRENCE RECORD (name layer):
+  [02 00 00 30][u32 0][u32 namelen][UTF16 name]
+Decoded from assembly.iam — 9 records in order:
+  'D - simple part:1', 'Cyl:1'  (the two part instances)
+  'YZ Plane', 'XZ Plane', 'XY Plane', 'X Axis', 'Y Axis', 'Z Axis',
+  'Center Point'  (7 origin work features)
+
+TRANSFORM (0x42-tagged window):
+  [00 80 42 00] + 13 f64 doubles (12 transform values + trailing 0)
+Found in assembly.iam: 3 windows —
+  @1309: all zeros (unplaced/zero matrix)
+  @1448: [0,0,0,0, 0,0,-1,0, 0,0,-0,1, 0]  (a 90-degree placement —
+         the Cyl:1 instance rotation seen in the viewer)
+  @1583: [0,0,0,0, 0,1,0,-0, -0,1,0,0, 0]  (second placement/mate frame)
+Exact row/column-major semantics + translation slot pending ONE more
+ground-truth sample (an assembly with a known linear offset, e.g. a part
+placed 50 mm along X).
+
+iptinfo now ships:
+  occurrences()  -> [{name}] for .iam files (9 records for assembly.iam)
+  placed_transform() -> all non-zero 0x42-tagged windows (raw 12 doubles)
+  assembly_tree() -> browser-filter records (UCx* classes)
+All 16 corpus files still parse; part (.ipt) summaries are unchanged
+(assembly decoding is .iam-scoped).
+
+.deva roadmap update: tree ✓, occurrences ✓ (records+names),
+constraints ✓ (session 16), transforms ✓ (located+extracted, semantics
+pending 1 sample). Writer is next.
+
 ## 8. Open questions / next probes
 1. Parameter record full grammar: unit token, parameter type/flags,
   tolerance fields, multi-parameter files (B2c with 3 params?)
