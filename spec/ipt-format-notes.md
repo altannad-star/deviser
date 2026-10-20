@@ -733,6 +733,34 @@ GUI (AppImage AS-1.6, md5 e5f268b149468a5fd0d028a3ef3175b3):
   - Save .deva: converts the loaded .iam to native .deva
   - part editing unchanged (regression: D sample skeleton + edit OK)
 
+## 7y. Session 18 — E5 SKETCH EDITOR SHIPPED
+
+Deviser side (no Inventor input needed): a freehand sketch editor
+in the Qt app (AppImage E5-1.7).
+
+  - SketchCanvas: dark grid canvas (5 mm grid), click-to-add polyline
+    points (origin bottom-left, mm), or circle mode (center click +
+    radius click). Live polygon/ellipse preview with fill.
+  - SketchDialog: polyline/circle toggle, Clear, extrude depth (mm),
+    fillet radius (mm) -> skeleton()
+  - skeleton(): polyline >= 3 points, area > 1 mm², shoelace winding
+    auto-corrected to CW (matching .ipt-extracted skeletons); circle
+    center+r>0.1mm; converts mm -> cm (x/10) for the E1 engine.
+  - Result lands in the standard editor flow: depth_cm/fillet_r_mm
+    rows in the parameter table, Apply & Rebuild (CadQuery), Save
+    .devp, Export STEP.
+
+Verified headless (offscreen Qt):
+  - 20x15x10mm rect sketch -> prism skeleton -> CadQuery rebuild
+    2965.66 mm³ (3000 minus 2mm fillets) ✓
+  - circle Ø20 r=10mm -> cylinder skeleton ✓
+  - CCW winding auto-corrected ✓
+  - incomplete sketches rejected (2 pts, no radius) ✓
+  - assembly view + part-edit regressions green ✓
+
+AppImage: Deviser-E5-1.7-x86_64.AppImage
+  (md5 9c170a8d6a0acc20cdc95595660ebeee, 62 MB)
+
 ## 8. Open questions / next probes
 1. Parameter record full grammar: unit token, parameter type/flags,
   tolerance fields, multi-parameter files (B2c with 3 params?)

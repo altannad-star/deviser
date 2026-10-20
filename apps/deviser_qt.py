@@ -388,9 +388,171 @@ def run_qt():
     from PySide6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QPushButton, QFileDialog, QTextEdit, QLabel, QMessageBox, QSplitter,
-        QTableWidget, QTableWidgetItem, QGroupBox, QDoubleSpinBox)
-    from PySide6.QtCore import Qt
-    from PySide6.QtGui import QPixmap
+        QTableWidget, QTableWidgetItem, QGroupBox, QDoubleSpinBox, QDialog,
+        QFormLayout, QDialogButtonBox, QComboBox, QRadioButton)
+    from PySide6.QtCore import Qt, QPointF
+    from PySide6.QtGui import QPixmap, QPainter, QPen, QColor, QBrush
+
+    class SketchCanvas(QWidget):
+        """E5: freehand sketch canvas. Left-click adds polyline points;
+        circle mode: click center then radius point. Grid = 5 mm."""
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setMinimumSize(500, 400)
+            self.mode = "polyline"
+            self.points = []       # list of (x_mm, y_mm), origin bottom-left
+            self.circle_center = None
+            self.circle_r = None
+            self.scale = 4.0       # pixels per mm
+            self.margin = 20.0
+
+        def set_mode(self, mode):
+            self.mode = mode
+            if mode == "circle":
+                self.points = []
+            else:
+                self.circle_center = self.circle_r = None
+            self.update()
+
+        def clear(self):
+            self.points = []
+            self.circle_center = self.circle_r = None
+            self.update()
+
+        def _to_mm(self, pos):
+            return ((pos.x() - self.margin) / self.scale,
+                    (self.height() - self.margin - pos.y()) / self.scale)
+
+        def _to_px(self, x_mm, y_mm):
+            return (self.margin + x_mm * self.scale,
+                    self.height() - self.margin - y_mm * self.scale)
+
+        def mousePressEvent(self, ev):
+            if ev.button() != Qt.LeftButton:
+                return
+            pt = self._to_mm(ev.position())
+            if self.mode == "circle":
+                if self.circle_center is None:
+                    self.circle_center = pt
+                else:
+                    self.circle_r = ((pt[0] - self.circle_center[0]) ** 2
+                                     + (pt[1] - self.circle_center[1]) ** 2) ** 0.5
+            else:
+                self.points.append(pt)
+            self.update()
+
+        def paintEvent(self, ev):
+            p = QPainter(self)
+            p.setRenderHint(QPainter.Antialiasing)
+            p.fillRect(self.rect(), QColor(30, 30, 30))
+            pen = QPen(QColor(70, 70, 70), 1)
+            p.setPen(pen)
+            step = 5 * self.scale
+            x = self.margin
+            while x < self.width():
+                p.drawLine(int(x), 0, int(x), self.height())
+                x += step
+            y = self.height() - self.margin
+            while y > 0:
+                p.drawLine(0, int(y), self.width(), int(y))
+                y -= step
+            pen = QPen(QColor(150, 150, 150), 2)
+            p.setPen(pen)
+            p.drawLine(int(self.margin), 0, int(self.margin), self.height())
+            p.drawLine(0, int(self.height() - self.margin),
+                       self.width(), int(self.height() - self.margin))
+            if self.mode == "circle" and self.circle_center:
+                c = self._to_px(*self.circle_center)
+                p.setPen(QPen(QColor(80, 170, 255), 2))
+                if self.circle_r:
+                    p.setBrush(QBrush(QColor(80, 170, 255, 40)))
+                    p.drawEllipse(QPointF(*c), self.circle_r * self.scale,
+                                  self.circle_r * self.scale)
+                p.drawEllipse(QPointF(*c), 3, 3)
+            elif self.points:
+                p.setPen(QPen(QColor(80, 170, 255), 2))
+                p.setBrush(QBrush(QColor(80, 170, 255, 40)))
+                pts = [QPointF(*self._to_px(*pt)) for pt in self.points]
+                if len(pts) >= 3:
+                    p.drawPolygon(pts)
+                for i in range(len(pts) - 1):
+                    p.drawLine(pts[i], pts[i + 1])
+                for pt in pts:
+                    p.drawEllipse(pt, 3, 3)
+            p.end()
+
+    class SketchDialog(QDialog):
+        """E5: freehand sketch -> skeleton (prism or cylinder)."""
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setWindowTitle("E5 — Sketch a part")
+            self.resize(760, 560)
+            lay = QVBoxLayout(self)
+            top = QHBoxLayout()
+            self.rb_poly = QRadioButton("Polyline")
+            self.rb_circ = QRadioButton("Circle")
+            self.rb_poly.setChecked(True)
+            top.addWidget(self.rb_poly)
+            top.addWidget(self.rb_circ)
+            btn_clear = QPushButton("Clear")
+            btn_clear.clicked.connect(self._clear)
+            top.addWidget(btn_clear)
+            top.addStretch()
+            lbl = QLabel("click to add points (grid 5 mm) — ≥3 points close a prism")
+            top.addWidget(lbl)
+            lay.addLayout(top)
+            self.canvas = SketchCanvas()
+            lay.addWidget(self.canvas, stretch=1)
+            self.rb_poly.toggled.connect(
+                lambda on: self.canvas.set_mode("polyline" if on else "circle"))
+            self.rb_circ.toggled.connect(
+                lambda on: self.canvas.set_mode("circle" if on else "polyline"))
+            form = QFormLayout()
+            self.depth = QDoubleSpinBox(); self.depth.setDecimals(2)
+            self.depth.setRange(0.1, 1000); self.depth.setValue(10.0)
+            self.fillet = QDoubleSpinBox(); self.fillet.setDecimals(2)
+            self.fillet.setRange(0.0, 100); self.fillet.setValue(0.0)
+            form.addRow("Extrude depth (mm):", self.depth)
+            form.addRow("Fillet r (mm, 0=none):", self.fillet)
+            lay.addLayout(form)
+            buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            buttons.accepted.connect(self.accept)
+            buttons.rejected.connect(self.reject)
+            lay.addWidget(buttons)
+
+        def _clear(self):
+            self.canvas.clear()
+
+        def skeleton(self):
+            """Build a skeleton dict from the sketch (None if incomplete)."""
+            if self.canvas.mode == "circle":
+                c = self.canvas.circle_center
+                r = self.canvas.circle_r
+                if not (c and r and r > 0.1):
+                    return None
+                return {"type": "cylinder",
+                        "center_cm": [c[0] / 10.0, c[1] / 10.0],
+                        "radius_cm": r / 10.0,
+                        "depth_cm": self.depth.value() / 10.0,
+                        "fillet_r_mm": self.fillet.value(), "chamfer_mm": 0,
+                        "holes": []}
+            pts = self.canvas.points
+            if len(pts) < 3:
+                return None
+            area = 0.0
+            for i in range(len(pts)):
+                x1, y1 = pts[i]
+                x2, y2 = pts[(i + 1) % len(pts)]
+                area += x1 * y2 - x2 * y1
+            if abs(area) / 2.0 < 1.0:
+                return None
+            if area > 0:
+                pts = list(reversed(pts))
+            return {"type": "prism",
+                    "verts_cm": [[p[0] / 10.0, p[1] / 10.0] for p in pts],
+                    "depth_cm": self.depth.value() / 10.0,
+                    "fillet_r_mm": self.fillet.value(), "chamfer_mm": 0,
+                    "holes": []}
 
     class Win(QMainWindow):
         def __init__(self):
@@ -406,6 +568,7 @@ def run_qt():
 
             top = QHBoxLayout()
             btn_new = QPushButton("New Part…")
+            btn_sketch = QPushButton("Sketch…")
             btn_open = QPushButton("Open .ipt…")
             btn_open_devp = QPushButton("Open .devp…")
             btn_devp = QPushButton("Save .devp…")
@@ -413,7 +576,7 @@ def run_qt():
             btn_obj = QPushButton("Export OBJ…")
             btn_step = QPushButton("Export STEP…")
             btn_json = QPushButton("Save JSON…")
-            for b in (btn_new, btn_open, btn_open_devp, btn_devp, btn_deva, btn_obj, btn_step, btn_json):
+            for b in (btn_new, btn_sketch, btn_open, btn_open_devp, btn_devp, btn_deva, btn_obj, btn_step, btn_json):
                 top.addWidget(b)
             lbl = QLabel("clean-room · no Autodesk code")
             top.addStretch()
@@ -457,6 +620,7 @@ def run_qt():
             root.addWidget(edit_group)
 
             btn_new.clicked.connect(self.new_part)
+            btn_sketch.clicked.connect(self.sketch_part)
             btn_open.clicked.connect(self.open_file)
             btn_open_devp.clicked.connect(self.open_devp)
             btn_devp.clicked.connect(self.save_devp)
@@ -613,6 +777,52 @@ def run_qt():
                     self, "Deviser", f"Exported EDITED solid{' + features' if feats else ''}:\n{p}\nvolume {vol:.2f} mm³")
             except Exception as e:
                 QMessageBox.critical(self, "Deviser", f"Export failed:\n{e}")
+
+        def sketch_part(self):
+            """E5: freehand sketch -> skeleton -> editable/saveable part."""
+            dlg = SketchDialog(self)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            sk = dlg.skeleton()
+            if sk is None:
+                QMessageBox.information(
+                    self, "Deviser",
+                    "Sketch incomplete:\n- polyline: click ≥3 points (area > 1 mm²)\n"
+                    "- circle: click center, then a radius point")
+                return
+            self.skeleton = sk
+            self.ipt = None
+            self.summary = None
+            self.devp_doc = {
+                "format": "devp", "version": 1, "units": "mm",
+                "part": {"title": "Sketched part", "author": "", "material": {}},
+                "parameters": {}, "skeleton": sk, "history": [],
+                "provenance": {"source": "deviser-sketch"},
+            }
+            if sk["type"] == "cylinder":
+                desc = (f"circle Ø{sk['radius_cm']*20:.1f} mm "
+                        f"at ({sk['center_cm'][0]*10:.0f}, {sk['center_cm'][1]*10:.0f})")
+            else:
+                desc = f"polygon with {len(sk['verts_cm'])} vertices"
+            self.info.setPlainText(
+                f"Sketched Deviser part\nType:    {sk['type']} ({desc})\n"
+                f"Depth:   {sk['depth_cm']*10:.1f} mm\n"
+                f"Fillet:  {sk['fillet_r_mm'] or 0} mm\n\n"
+                "Edit values below, Apply & Rebuild, then Save .devp / Export STEP.")
+            self.thumb.setText("(sketched part)")
+            self.param_table.setRowCount(0)
+            for pname, pval in [("depth_cm", sk["depth_cm"]),
+                                ("fillet_r_mm", sk.get("fillet_r_mm", 0.0))]:
+                row = self.param_table.rowCount()
+                self.param_table.insertRow(row)
+                self.param_table.setItem(row, 0, QTableWidgetItem(pname))
+                sb = QDoubleSpinBox(); sb.setDecimals(4); sb.setRange(-1000, 1000)
+                sb.setValue(float(pval))
+                self.param_table.setCellWidget(row, 1, sb)
+            self.btn_rebuild.setEnabled(True)
+            self.btn_step_edited.setEnabled(HAS_CQ)
+            self.btn_devp.setEnabled(True)
+            self.edit_status.setText("Sketch done — edit depth/fillet, rebuild, save .devp.")
 
         def new_part(self):
             """E4: create a Deviser part from scratch (no .ipt source)."""
