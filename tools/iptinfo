@@ -401,9 +401,9 @@ def _plausible_transform(vals):
     axis-permutation placements: exact 0/+-1 entries in ground truth)."""
     if any(v != v for v in vals):
         return False
-    if len(vals) >= 12 and max(abs(v) for v in vals[:12]) > 1.5:
+    if max(abs(v) for v in vals) > 1.5:
         return False
-    return len(vals) >= 12
+    return len(vals) >= 9
 
 def _scan_transforms(payload, occurrences):
     """Find occurrence transforms in the payload. Session 16b ground truth
@@ -421,10 +421,17 @@ def _scan_transforms(payload, occurrences):
         if i < 0:
             break
         base = i + 4
-        if base + 104 <= len(b):
-            vals = list(struct.unpack_from("<13d", b, base))
+        end = b.find(b"\x7e\x00", base, base + 120)
+        if end > base:
+            n = (end - base) // 8
+            vals = [struct.unpack_from("<d", b, base + 8 * k)[0]
+                    for k in range(n)]
             if _plausible_transform(vals):
-                out.append(vals[:12])
+                out.append(vals)
+        elif base + 96 <= len(b):
+            vals = list(struct.unpack_from("<12d", b, base))
+            if _plausible_transform(vals):
+                out.append(vals)
         i += 1
     for occ in occurrences:
         occ["transform"] = None

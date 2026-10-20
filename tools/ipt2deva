@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""deva — Deviser native assembly format (.deva) reader/writer.
+
+Format design (session 17, mirrors .devp):
+  .deva = MAGIC "DEVA" + u16 version + zstd(level 19)(JSON):
+  {
+    "format": "deva",
+    "version": 1,
+    "units": "mm",
+    "assembly": {"title": "...", "author": "..."},
+    "occurrences": [
+      {"name": "Cyl:1",
+       "part": "cyl.ipt",          # referenced part (or .devp)
+       "transform": [12 floats],   # raw 3x4 as extracted (session 16b)
+       "placed": true|false}
+    ],
+    "constraints": [
+      {"name": "Mate:1", "type": "mate"}    # AmMateEntry
+    ],
+    "browser_filters": [...],      # UCx* classes (informational)
+    "provenance": {"source": "iam", "original_file": "assembly.iam"}
+  }
+
+Clean-room by construction: everything here comes from observation of
+assembly.iam (sessions 14b-16b), never from decompiling Inventor.
+"""
+import json
+import struct
+import sys
+import os
+
+MAGIC = b"DEVA"
+VERSION = 1
+
+try:
+    import zstandard as zstd
+except ImportError:
+    sys.stderr.write("deva format requires: pip install zstandard\n")
+    sys.exit(2)
+
+import importlib.util
+import importlib.machinery
+
+
+def _load(name, target):
+    here = os.path.dirname(os.path.abspath(__file__))
+    for p in (os.path.join(here, name),
+              os.path.join(getattr(sys, "_MEIPASS", here), name)):
+        if os.path.exists(p):
+            loader = importlib.machinery.SourceFileLoader(target, p)
+            spec = importlib.util.spec_from_loader(target, loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            return mod
+    raise RuntimeError(f"module {name} not found")
+
+
+iptinfo = _load("iptinfo", "iptinfo")
+
+# Names that are origin work features, not part occurrences
+_ORIGIN_NAMES = {"YZ Plane", "XZ Plane", "XY Plane", "X Axis", "Y Axis",
+                 "Z Axis", "Center Point"}
+
+
+def make_deva(iam_path, part_resolver=None):
+    """Build a .deva document dict from an .iam file.
+
+    part_resolver: optional callable(name) -> referenced filename;
+    default heuristic strips the ':N' instance suffix.
+    """
+    with iptinfo.IptFile(iam_path) as iam:
+        s = iam.summary()
+        occs = s.get("occurrences") or []
+        placed = s.get("placed_transform") or []
+        tree = s.get("assembly_tree") or []
+
+        parts = []
+        origin = []
+        for o in occs:
+            name = o["name"]
+            if name in _ORIGIN_NAMES:
+                origin.append({"name": name})
+            else:
+                base = name.rsplit(":", 1)[0] if ":" in name else name
+                ref = part_resolver(base) if part_resolver else base
+                parts.append({"name": name, "part": ref, "placed": False,
+                              "transform": None})
+
+        # Placed transforms: 0x42-tagged windows (session 16b). With 2
+        # parts there are 2 non-zero windows (placement + mate frame).
+        # Attribution pending a translated sample; store raw values per
+        # occurrence, windows assigned to the last parts in order.
+        nonzero = [t for t in placed if any(abs(v) > 1e-9 for v in t)]
+        if parts:
+            for p in parts:
+                p["transform"] = [1.0, 0.0, 0.0, 0.0,
+                                   0.0, 1.0, 0.0, 0.0,
+                                   0.0, 0.0, 1.0, 0.0]
+            for idx, t in enumerate(nonzero):
+                if idx < len(parts):
+                    p = parts[len(parts) - len(nonzero) + idx]
+                    p["placed"] = True
+                    p["transform"] = t + [0.0] * (12 - len(t))
+
+        # Constraints: AmMateEntry names (session 16) — iptinfo's tree
+        # decoder reports browser filters; mates come from the occ layer
+        # where the name matches 'Mate'/'Insert'/'Angle' patterns.
+        constraints = []
+        for o in occs:
+            n = o["name"]
+            if any(n.startswith(k) for k in ("Mate", "Insert", "Angle",
+                                             "Tangent", "Flush")):
+                constraints.append({"name": n, "type": n.rsplit(":", 1)[0]})
+
+        doc = {
+            "format": "deva",
+            "version": VERSION,
+            "units": "mm",
+            "assembly": {
+                "title": s.get("part_title"),
+                "author": s.get("author"),
+            },
+            "occurrences": parts,
+            "origin_features": origin,
+            "constraints": constraints,
+            "browser_filters": [{"name": e["name"], "class": e["class"]}
+                                for e in tree],
+            "parameters": {k: v for k, v in (s.get("parameters") or {}).items()
+                           if isinstance(v, (int, float, str))},
+            "provenance": {"source": "iam",
+                           "original_file": os.path.basename(iam_path)},
+        }
+    return doc
+
+
+def save_deva(doc, path):
+    payload = json.dumps(doc, indent=1, default=str).encode()
+    packed = zstd.ZstdCompressor(level=19).compress(payload)
+    with open(path, "wb") as f:
+        f.write(MAGIC)
+        f.write(struct.pack("<H", doc.get("version", VERSION)))
+        f.write(packed)
+    return os.path.getsize(path)
+
+
+def load_deva(path):
+    with open(path, "rb") as f:
+        head = f.read(6)
+        if len(head) < 6 or head[:4] != MAGIC:
+            raise ValueError("not a .deva file (bad magic)")
+        ver = struct.unpack_from("<H", head, 4)[0]
+        if ver > VERSION:
+            raise ValueError(f"deva v{ver} newer than supported v{VERSION}")
+        packed = f.read()
+    payload = zstd.ZstdDecompressor().decompress(packed,
+                                                 max_output_size=10_000_000)
+    doc = json.loads(payload.decode())
+    if doc.get("format") != "deva":
+        raise ValueError("deva doc missing format tag")
+    return doc
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(description="Deviser .deva assembly format tool")
+    ap.add_argument("iam_file", help="input .iam to convert")
+    ap.add_argument("-o", "--output", help="output .deva path")
+    ap.add_argument("--json", action="store_true", help="dump doc as JSON")
+    ap.add_argument("--round-trip", action="store_true",
+                    help="verify save->load round-trip equality")
+    args = ap.parse_args()
+
+    out = args.output or (args.iam_file.rsplit(".", 1)[0] + ".deva")
+    doc = make_deva(args.iam_file)
+    size = save_deva(doc, out)
+    print(f"wrote {out} ({size} bytes, deva v{VERSION})")
+    if args.json:
+        print(json.dumps(doc, indent=2, default=str))
+    if args.round_trip:
+        doc2 = load_deva(out)
+        assert doc == doc2, "round-trip mismatch"
+        print(f"round-trip OK: {len(doc['occurrences'])} occurrences, "
+              f"{len(doc['constraints'])} constraints")
+
+
+if __name__ == "__main__":
+    main()

@@ -33,6 +33,10 @@ def load_module(name, target):
 
 iptinfo = load_module("iptinfo", "iptinfo")
 ipt2obj_mod = load_module("ipt2obj", "ipt2obj_mod")
+try:
+    ipt2deva_mod = load_module("ipt2deva", "ipt2deva_mod")
+except Exception:
+    ipt2deva_mod = None
 IptFile = iptinfo.IptFile
 try:
     ipt2devp_mod = load_module("ipt2devp", "ipt2devp_mod")
@@ -405,10 +409,11 @@ def run_qt():
             btn_open = QPushButton("Open .ipt…")
             btn_open_devp = QPushButton("Open .devp…")
             btn_devp = QPushButton("Save .devp…")
+            btn_deva = QPushButton("Save .deva…")
             btn_obj = QPushButton("Export OBJ…")
             btn_step = QPushButton("Export STEP…")
             btn_json = QPushButton("Save JSON…")
-            for b in (btn_new, btn_open, btn_open_devp, btn_devp, btn_obj, btn_step, btn_json):
+            for b in (btn_new, btn_open, btn_open_devp, btn_devp, btn_deva, btn_obj, btn_step, btn_json):
                 top.addWidget(b)
             lbl = QLabel("clean-room · no Autodesk code")
             top.addStretch()
@@ -455,6 +460,7 @@ def run_qt():
             btn_open.clicked.connect(self.open_file)
             btn_open_devp.clicked.connect(self.open_devp)
             btn_devp.clicked.connect(self.save_devp)
+            btn_deva.clicked.connect(self.save_deva)
             btn_obj.clicked.connect(self.export_obj)
             btn_step.clicked.connect(self.export_step)
             btn_json.clicked.connect(self.export_json)
@@ -462,13 +468,17 @@ def run_qt():
 
         def open_file(self):
             p, _ = QFileDialog.getOpenFileName(
-                self, "Choose an Inventor part", "", "Inventor part (*.ipt);;All files (*)")
+                self, "Choose an Inventor part or assembly", "",
+                "Inventor part/assembly (*.ipt *.iam);;All files (*)")
             if not p:
                 return
             try:
                 self.ipt = IptFile(p)
             except Exception as e:
                 QMessageBox.critical(self, "Deviser", f"Cannot open file:\n{e}")
+                return
+            if p.lower().endswith(".iam"):
+                self._open_assembly(p)
                 return
             self.summary, report = build_report(self.ipt)
             self.info.setPlainText(report)
@@ -661,6 +671,68 @@ def run_qt():
             self.btn_step_edited.setEnabled(HAS_CQ)
             self.btn_devp.setEnabled(True)
             self.edit_status.setText("New part created — edit dims, rebuild, save .devp.")
+
+        def _open_assembly(self, p):
+            """Session 17: .iam assembly view (tree + occurrences + transforms)."""
+            s = self.ipt.summary()
+            lines = [f"=== Assembly: {os.path.basename(p)} ===",
+                     f"Title:       {s['part_title']}",
+                     f"Author:      {s.get('author')}",
+                     ""]
+            occs = s.get("occurrences") or []
+            lines.append(f"Occurrences ({len(occs)}):")
+            for o in occs:
+                lines.append(f"  - {o['name']}")
+            placed = s.get("placed_transform") or []
+            if placed:
+                lines.append("Placed transforms:")
+                for t in placed:
+                    lines.append(f"  {[round(v, 4) for v in t]}")
+            cons = [o for o in occs
+                    if any(o['name'].startswith(k) for k in
+                           ("Mate", "Insert", "Angle", "Tangent", "Flush"))]
+            if cons:
+                lines.append(f"Constraints ({len(cons)}): "
+                             + ", ".join(c['name'] for c in cons))
+            lines.append("")
+            lines.append("(Assembly decode: clean-room, session 16-17. "
+                         "Save as .deva via File dialog filter.)")
+            self.info.setPlainText("\n".join(lines))
+            png = self.ipt.thumbnail()
+            if png:
+                pm = QPixmap()
+                pm.loadFromData(png)
+                self.thumb.setPixmap(pm.scaled(
+                    340, 340, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            else:
+                self.thumb.setText("(no thumbnail)")
+            self.btn_step.setEnabled(False)
+            self.btn_rebuild.setEnabled(False)
+            self.btn_step_edited.setEnabled(False)
+            self.edit_status.setText("Assembly loaded — occurrence tree decoded.")
+
+        def save_deva(self):
+            """Session 17: convert the loaded .iam to native .deva format."""
+            if ipt2deva_mod is None:
+                QMessageBox.warning(self, "Deviser", ".deva module unavailable")
+                return
+            if not (self.ipt and self.ipt.path.lower().endswith(".iam")):
+                QMessageBox.information(self, "Deviser", "Open an .iam assembly first.")
+                return
+            p, _ = QFileDialog.getSaveFileName(
+                self, "Save Deviser assembly", os.path.splitext(self.ipt.path)[0] + ".deva",
+                "Deviser assembly (*.deva)")
+            if not p:
+                return
+            try:
+                doc = ipt2deva_mod.make_deva(self.ipt.path)
+                size = ipt2deva_mod.save_deva(doc, p)
+                QMessageBox.information(
+                    self, "Deviser",
+                    f"Saved {p}\n({size} bytes, deva v{doc['version']}, "
+                    f"{len(doc['occurrences'])} occurrences)")
+            except Exception as e:
+                QMessageBox.critical(self, "Deviser", f"Cannot save .deva:\n{e}")
 
         def open_devp(self):
             if ipt2devp_mod is None:

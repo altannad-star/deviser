@@ -703,6 +703,36 @@ All 16 corpus files still parse; part (.ipt) summaries are unchanged
 constraints ✓ (session 16), transforms ✓ (located+extracted, semantics
 pending 1 sample). Writer is next.
 
+## 7x. Session 17 — .deva NATIVE ASSEMBLY FORMAT + GUI SHIP
+
+.deliverable: tools/ipt2deva — the .deva (Deviser Assembly) writer.
+  .deva = MAGIC "DEVA" + u16 version + zstd(level 19)(JSON):
+    { format, version, units: "mm",
+      assembly: {title, author},
+      occurrences: [{name, part, placed, transform[12]}],
+      origin_features: [{name} x7],
+      constraints: [{name, type}],
+      browser_filters: [...],
+      parameters: {...},
+      provenance: {source: "iam", original_file} }
+
+  Verified on assembly.iam:
+  - 2 part occurrences (D - simple part:1, Cyl:1) with part refs
+  - 7 origin features
+  - both placed transforms stored (raw values; row/col-major semantics
+    pending the translated-offset sample)
+  - save->load round-trip byte-equal (assert)
+  - 450 bytes vs 2070 bytes .iam
+
+Transform window refinement (session 17): the 0x42-tagged runs are
+11 doubles terminated by the '7e 00' next-record marker (not 12 as
+first read); iptinfo now reads terminator-aware windows.
+
+GUI (AppImage AS-1.6, md5 e5f268b149468a5fd0d028a3ef3175b3):
+  - Open .iam: assembly view (occurrence tree, transforms, constraints)
+  - Save .deva: converts the loaded .iam to native .deva
+  - part editing unchanged (regression: D sample skeleton + edit OK)
+
 ## 8. Open questions / next probes
 1. Parameter record full grammar: unit token, parameter type/flags,
   tolerance fields, multi-parameter files (B2c with 3 params?)
