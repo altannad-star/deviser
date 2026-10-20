@@ -598,6 +598,19 @@ The RDxVar0 expression table (found session 12) is now fully decoded:
 
 All 5 ground-truth samples validate the engines built in E1-E4.
 
+
+## 7s. Session 14b — .iam assembly support (step 2)
+
+- iptinfo parses .iam out of the box (same container/RSe engine).
+  Verified on assembly.iam: title='Assembly', thumbnail, RSe v8.
+- PART REFERENCES found in B* zstd payloads as UTF-16 names:
+  'Cyl:1' (occurrence instance label — Inventor's name:instanceNo form)
+  'D - simple part' (referenced part display name)
+- RefdFiles/ storage exists but is EMPTY in this sample; references live
+  in the payloads (occurrence records).
+- .deva roadmap: container ✓ (already), occurrence extraction (found),
+  constraint decode (next), instance transforms (TBD).
+
 ## 8. Open questions / next probes
 1. Parameter record full grammar: unit token, parameter type/flags,
   tolerance fields, multi-parameter files (B2c with 3 params?)
