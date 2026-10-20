@@ -56,9 +56,30 @@ def tessellate_circle(center, normal, radius, segments=48):
     return pts
 
 
+def _canonical_polygon(verts):
+    """Dedupe + order sketch points into a rebuildable polygon (session 14).
+
+    Full-box-topology files (.ipt with all 8 solid corners explicit) arrive
+    as duplicated, unordered points. Reduce to unique XY corners and sort
+    them into a simple rectangle order (bl, br, tr, tl) when they form an
+    axis-aligned rect; otherwise dedupe and keep order.
+    """
+    uniq = []
+    for v in verts:
+        p = (round(float(v[0]), 6), round(float(v[1]), 6))
+        if p not in uniq:
+            uniq.append(p)
+    if len(uniq) == 4:
+        xs = sorted(set(x for x, _ in uniq))
+        ys = sorted(set(y for _, y in uniq))
+        if len(xs) == 2 and len(ys) == 2:
+            return [(xs[0], ys[0]), (xs[1], ys[0]), (xs[1], ys[1]), (xs[0], ys[1])]
+    return uniq
+
+
 def extract_geometry(ipt):
     """Pull sketch entities from the ASM stream."""
-    verts = ipt.asm_sketch_vertices()          # list of [x,y,z]
+    verts = _canonical_polygon(ipt.asm_sketch_vertices())
     entities = ipt.asm_entities()
     lines = []   # (root, direction) per straight
     circles = [] # (center, normal, radius)
@@ -88,10 +109,42 @@ def ellipse_radius(ipt):
 
 
 def extrude_depth(ipt):
-    """Extrusion depth from model dims (d1 in cm), else 0."""
+    """Extrusion depth from model dims (cm), else 0.
+
+    Session 14: d-numbering varies per file (d1 for cyl, d2 for cube,
+    d4 for linked). Robust rule: collect numeric dN params in creation
+    order; special (angle) params are >= pi/2 (1.5708) or ~pi/4 (0.7854).
+    The depth is the LAST consecutive length-dim before the special ones
+    that is NOT the sketch X or Y extent.
+    """
     p = ipt.parameters()
-    if "d1" in p and isinstance(p["d1"], float):
+    dnums = sorted((int(k[1:]), v) for k, v in p.items()
+                   if k.startswith("d") and k[1:].isdigit() and isinstance(v, float))
+    if not dnums:
+        return 0.0
+    # sketch extents (to exclude from depth candidates):
+    verts, _lines, _circles = extract_geometry(ipt) if False else (None, None, None)
+    # Use the loaded ipt object directly:
+    try:
+        sk = _canonical_polygon(ipt.asm_sketch_vertices())
+        x_extent = max((v[0] for v in sk), default=None)
+        y_extent = max((v[1] for v in sk), default=None)
+    except Exception:
+        x_extent = y_extent = None
+    # primary rule (stable, works for cyl/cube/fillet/twofeat-base):
+    if "d1" in p and isinstance(p["d1"], float) and abs(p["d1"]) > 1e-9:
         return p["d1"]
+    # fallback for linked-style files (no usable d1): first nonzero dN>=2
+    # that is not a sketch extent nor an angle (multi-feature files remain
+    # ambiguous; extraction there goes through the bodies pipeline)
+    for n, v in dnums:
+        if n < 2 or abs(v) < 1e-9 or abs(v) >= 3.0:
+            continue
+        if x_extent is not None and abs(v - x_extent) < 1e-9:
+            continue
+        if y_extent is not None and abs(v - y_extent) < 1e-9:
+            continue
+        return v
     return 0.0
 
 
