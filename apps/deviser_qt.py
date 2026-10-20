@@ -62,6 +62,7 @@ def auto_fillet_radius(ipt):
 
 # ---------------- E1: parameter editing engine ----------------
 import copy
+import re
 
 def extract_skeleton(ipt):
     """Geometry skeleton + parameter->geometry bindings (E1)."""
@@ -75,22 +76,83 @@ def extract_skeleton(ipt):
                    if isinstance(k, str) and k.startswith("d") and k[1:].isdigit()
                    and isinstance(params[k], float))
     if len(verts) >= 3:
-        depth_candidates = [n for n in dnums if 2 <= n < 4]
-        depth_param = f"d{depth_candidates[0]}" if depth_candidates else None
+        # sketch dims are d0,d1 (or d2,d3 for linked-style files where
+        # MyWidth-style user params shift numbering); the extrude is the
+        # next dim. Robust: d1 if it exists and is nonzero; else the first
+        # dN>=2 that is not a sketch extent.
+        p1 = params.get("d1")
+        if isinstance(p1, float) and abs(p1) > 1e-9:
+            depth_param = "d1"
+        else:
+            x_ext = max((v[0] for v in verts), default=None)
+            y_ext = max((v[1] for v in verts), default=None)
+            depth_param = None
+            for n in dnums:
+                if n < 2:
+                    continue
+                v = params.get(f"d{n}")
+                if not isinstance(v, float) or abs(v) < 1e-9 or abs(v) >= 3.0:
+                    continue
+                if x_ext is not None and abs(v - x_ext) < 1e-9:
+                    continue
+                if y_ext is not None and abs(v - y_ext) < 1e-9:
+                    continue
+                depth_param = f"d{n}"
+                break
     elif circles:
         depth_param = "d1"
+    fr = 0.0
     for k, v in params.items():
-        if isinstance(v, float) and k.startswith("d") and k[1:].isdigit() and int(k[1:]) >= 4:
+        if (isinstance(v, float) and k.startswith("d") and k[1:].isdigit()
+                and int(k[1:]) >= 4 and k != depth_param and abs(v) > 1e-9):
             fr = v * 10.0
             break
     if len(verts) >= 3 and depth > 0:
-        return {"type": "prism", "verts_cm": [tuple(v) for v in verts],
-                "depth_cm": depth, "fillet_r_mm": fr, "depth_param": depth_param}, params
+        skel = {"type": "prism", "verts_cm": [tuple(v) for v in verts],
+                "depth_cm": depth, "fillet_r_mm": fr, "depth_param": depth_param,
+                "_orig_params": {k: v for k, v in params.items() if isinstance(v, float)}}
+        return skel, params
     elif circles and radius:
         return {"type": "cylinder", "center_cm": tuple(circles[0][0]),
                 "radius_cm": radius, "depth_cm": depth, "fillet_r_mm": fr,
                 "depth_param": depth_param}, params
     return None, params
+
+
+def linked_sketch_dim(ipt, param_name):
+    """E1.5: find the sketch d-dim driven by a user param (or None).
+
+    Binding rule (session 14 ground truth): user param P links to sketch
+    dim dN if the dependency graph lists dN in P's scope AND their values
+    are equal. (Value equality + scope = the proven binding signature.)
+    """
+    try:
+        links = ipt.parameter_links()
+        params = ipt.parameters()
+    except Exception:
+        return None
+    if param_name not in links or param_name not in params:
+        return None
+    pval = params[param_name]
+    if not isinstance(pval, float):
+        return None
+    for ref in links[param_name]:
+        if ref.startswith("d") and ref[1:].isdigit():
+            rval = params.get(ref)
+            if isinstance(rval, float) and abs(rval - pval) < 1e-9:
+                return ref
+    return None
+
+
+def apply_edit_linked(sk, param_name, new_value_cm, ipt=None):
+    """E1.5-aware apply_edit: user-param edits propagate to linked dims."""
+    if ipt is not None and not param_name.startswith("d"):
+        dim = linked_sketch_dim(ipt, param_name)
+        if dim:
+            # propagate: scale the sketch by the dim's new value
+            scale_dim = dim  # e.g. 'd2' -> drives sketch extent
+            return apply_edit(sk, scale_dim, new_value_cm)
+    return apply_edit(sk, param_name, new_value_cm)
 
 
 def apply_edit(sk, param_name, new_value_cm):
@@ -113,10 +175,38 @@ def apply_edit(sk, param_name, new_value_cm):
     # E1: Inventor d-params
     elif sk["type"] == "cylinder" and param_name == "d0":
         sk["radius_cm"] = new_value_cm / 2.0
-    elif sk["type"] == "prism" and param_name in ("d0", "d1") and param_name != sk.get("depth_param"):
-        old = max(max(v[0] for v in sk["verts_cm"]), max(v[1] for v in sk["verts_cm"]))
-        scale = new_value_cm / old if old else 1.0
-        sk["verts_cm"] = [(v[0]*scale, v[1]*scale) for v in sk["verts_cm"]]
+    elif (sk["type"] == "prism" and param_name != sk.get("depth_param")
+          and re.match(r"^d\d+$", param_name)):
+        # a sketch dim scales the axis it dimensions. Determine which axis:
+        # if the dim value equals the X extent -> scale X only;
+        # if it equals the Y extent -> scale Y only; else uniform.
+        xs = [v[0] for v in sk["verts_cm"]]
+        ys = [v[1] for v in sk["verts_cm"]]
+        x_ext = max(xs) if xs else 0
+        y_ext = max(ys) if ys else 0
+        old_val = None
+        if abs(x_ext - y_ext) > 1e-9:
+            old_val = x_ext  # ambiguous when equal; use max
+        else:
+            old_val = x_ext
+        # heuristics: scale the axis whose extent is NOT equal to the other
+        # — simpler: scale BOTH from the edited dim's original value.
+        # We need the original param value; passed via sk['_orig_params']:
+        orig = sk.get("_orig_params", {}).get(param_name)
+        if orig is not None and orig > 1e-9:
+            scale = new_value_cm / orig
+        else:
+            scale = new_value_cm / max(x_ext, y_ext) if max(x_ext, y_ext) else 1.0
+        # axis discrimination: if only one axis' extent matches the ORIGINAL
+        # value and the other doesn't, and they differ, scale only that axis:
+        x_matches = abs(x_ext - (orig if orig else -1)) < 1e-9
+        y_matches = abs(y_ext - (orig if orig else -1)) < 1e-9
+        if x_matches and not y_matches and abs(x_ext - y_ext) > 1e-9:
+            sk["verts_cm"] = [(v[0]*scale, v[1]) for v in sk["verts_cm"]]
+        elif y_matches and not x_matches and abs(x_ext - y_ext) > 1e-9:
+            sk["verts_cm"] = [(v[0], v[1]*scale) for v in sk["verts_cm"]]
+        else:
+            sk["verts_cm"] = [(v[0]*scale, v[1]*scale) for v in sk["verts_cm"]]
     elif param_name == sk.get("depth_param"):
         sk["depth_cm"] = new_value_cm
     elif param_name.startswith("d") and param_name[1:].isdigit() and int(param_name[1:]) >= 4:
@@ -389,7 +479,8 @@ def run_qt():
                 sb = self.param_table.cellWidget(row, 1)
                 if name_item is None or sb is None:
                     continue
-                sk = apply_edit(sk, name_item.text(), sb.value())
+                sk = apply_edit_linked(sk, name_item.text(), sb.value(),
+                                       getattr(self, "ipt", None))
             try:
                 wp = rebuild_solid(sk)
                 vol = wp.val().Volume()
