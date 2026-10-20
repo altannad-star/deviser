@@ -320,6 +320,65 @@ def make_step(ipt):
         os.unlink(tmp)
 
 
+# ------------- Feature replayer (chamfer / hole / boss) -------------
+
+def classify_features(params):
+    """Session-14 grammars -> ordered feature list from params."""
+    feats = []
+    has_ch = any(isinstance(v, float) and abs(abs(v) - math.pi/4) < 0.01 for v in params.values())
+    has_hole = any(isinstance(v, float) and abs(abs(v) - math.pi/2) < 0.01 for v in params.values())
+    has_angle = has_ch or has_hole
+    feat = sorted((int(k[1:]), v) for k, v in params.items()
+                  if isinstance(k, str) and k.startswith("d") and k[1:].isdigit()
+                  and isinstance(v, float) and 1e-9 < abs(v) < 3.0 and int(k[1:]) >= 4)
+    if has_ch:
+        dists = [v for n, v in feat if abs(v) < 1.0]
+        feats.append({"op": "chamfer", "mm": (dists[0] if dists else 0.2) * 10.0})
+    elif has_hole:
+        dias = [v for n, v in feat]
+        feats.append({"op": "hole", "dia_mm": (dias[0] if dias else 0.5) * 10.0})
+    elif not has_angle and len(feat) >= 2:
+        feats.append({"op": "boss", "dia_mm": feat[0][1] * 10.0,
+                      "depth_mm": feat[1][1] * 10.0})
+    return feats
+
+
+def replay_features(wp, feats, sk):
+    """Apply feature ops (chamfer/hole/boss) to a rebuilt base solid."""
+    import cadquery as cq
+    for f in feats:
+        if f["op"] == "chamfer":
+            wp = wp.edges("|Z").chamfer(f["mm"])
+        elif f["op"] == "hole":
+            xs = [v[0] for v in sk["verts_cm"]]
+            ys = [v[1] for v in sk["verts_cm"]]
+            cx = (min(xs) + max(xs)) / 2 * 10.0
+            cy = (min(ys) + max(ys)) / 2 * 10.0
+            wp = wp.faces(">Z").workplane().center(cx, cy).hole(f["dia_mm"])
+        elif f["op"] == "boss":
+            base_depth = sk["depth_cm"] * 10.0
+            xs = [v[0] for v in sk["verts_cm"]]
+            ys = [v[1] for v in sk["verts_cm"]]
+            cx = (min(xs) + max(xs)) / 2 * 10.0
+            cy = (min(ys) + max(ys)) / 2 * 10.0
+            wp = wp.union(cq.Workplane("XY").workplane(offset=base_depth)
+                          .center(cx, cy).circle(f["dia_mm"] / 2)
+                          .extrude(f["depth_mm"]))
+    return wp
+
+
+def rebuild_full(ipt):
+    """Base solid + feature replay (chamfer/hole/boss) -> workplane."""
+    sk, params = extract_skeleton(ipt)
+    if sk is None:
+        return None
+    wp = rebuild_solid(sk)
+    feats = classify_features(params)
+    if feats:
+        wp = replay_features(wp, feats, sk)
+    return wp
+
+
 # ------------------------- Qt native UI -------------------------
 def run_qt():
     from PySide6.QtWidgets import (

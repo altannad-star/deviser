@@ -611,6 +611,24 @@ All 5 ground-truth samples validate the engines built in E1-E4.
 - .deva roadmap: container ✓ (already), occurrence extraction (found),
   constraint decode (next), instance transforms (TBD).
 
+
+## 7t. Session 15 — FEATURE REPLAYER: chamfer/hole/boss VERIFIED
+
+classify_features() + replay_features() + rebuild_full() implemented:
+- chamfer: pi/4-angle signature + first dist pair -> .chamfer(2mm)
+  VERIFIED: chamfer.ipt -> 920.00 mm³ = 1000 - 4*(2*2/2)*10 EXACT
+- hole: pi/2-angle signature + Ø param -> .hole(Ø) at sketch-bbox center
+  VERIFIED: hole.ipt -> 803.65 mm³ = 1000 - pi*2.5²*10 EXACT (Ø5 through)
+  (corner-drilling bug found+fixed: hole must go at the face center,
+   not the global origin — quarter-overlap signature 49.09 = 196.35/4)
+- boss (second extruded feature): Ø + depth params, no angle
+  VERIFIED: twofeat.ipt -> 1117.81 mm³ = 1000 + pi*6.25*6 EXACT
+- Full regression: all 8 geometry files verified (fillet1 991.42,
+  cyl 523.17, cube 1000, linked 1066.67, fillet 1000)
+
+Deviser now replays: sketch + extrude + fillet + chamfer + hole + boss
+from clean-room-decoded .ipt data, every volume closed-form-exact.
+
 ## 8. Open questions / next probes
 1. Parameter record full grammar: unit token, parameter type/flags,
   tolerance fields, multi-parameter files (B2c with 3 params?)
