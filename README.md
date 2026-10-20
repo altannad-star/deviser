@@ -56,8 +56,8 @@ The system/software is called **Deviser**. Its file formats:
 
 - Transform semantics: row/column-major + translation slot — needs ONE
   ground-truth assembly with a known linear offset (e.g. 50 mm along X).
-- E5: sketch-canvas UI (freehand sketch editor).
-- `.devd` drawings / `.devx` presentations.
+- Inventor `.idw`/`.ipn` decode (drawing/presentation interop).
+- Transform semantics (translated-offset assembly sample).
 
 ## Roadmap (rough)
 

@@ -37,6 +37,14 @@ try:
     ipt2deva_mod = load_module("ipt2deva", "ipt2deva_mod")
 except Exception:
     ipt2deva_mod = None
+try:
+    ipt2devd_mod = load_module("ipt2devd", "ipt2devd_mod")
+except Exception:
+    ipt2devd_mod = None
+try:
+    ipt2devx_mod = load_module("ipt2devx", "ipt2devx_mod")
+except Exception:
+    ipt2devx_mod = None
 IptFile = iptinfo.IptFile
 try:
     ipt2devp_mod = load_module("ipt2devp", "ipt2devp_mod")
@@ -573,10 +581,13 @@ def run_qt():
             btn_open_devp = QPushButton("Open .devp…")
             btn_devp = QPushButton("Save .devp…")
             btn_deva = QPushButton("Save .deva…")
+            btn_devd = QPushButton("Drawing…")
+            btn_devx = QPushButton("Explosion…")
             btn_obj = QPushButton("Export OBJ…")
             btn_step = QPushButton("Export STEP…")
             btn_json = QPushButton("Save JSON…")
-            for b in (btn_new, btn_sketch, btn_open, btn_open_devp, btn_devp, btn_deva, btn_obj, btn_step, btn_json):
+            for b in (btn_new, btn_sketch, btn_open, btn_open_devp, btn_devp,
+                      btn_deva, btn_devd, btn_devx, btn_obj, btn_step, btn_json):
                 top.addWidget(b)
             lbl = QLabel("clean-room · no Autodesk code")
             top.addStretch()
@@ -625,6 +636,8 @@ def run_qt():
             btn_open_devp.clicked.connect(self.open_devp)
             btn_devp.clicked.connect(self.save_devp)
             btn_deva.clicked.connect(self.save_deva)
+            btn_devd.clicked.connect(self.save_drawing)
+            btn_devx.clicked.connect(self.save_explosion)
             btn_obj.clicked.connect(self.export_obj)
             btn_step.clicked.connect(self.export_step)
             btn_json.clicked.connect(self.export_json)
@@ -1036,6 +1049,64 @@ def run_qt():
                 QMessageBox.information(self, "Deviser", f"Saved:\n{p} ({size} bytes)")
             except Exception as e:
                 QMessageBox.critical(self, "Deviser", f"Save failed:\n{e}")
+
+        def save_drawing(self):
+            """Session 19: .devd drawing + SVG render from the current part."""
+            if ipt2devd_mod is None:
+                QMessageBox.warning(self, "Deviser", ".devd module unavailable")
+                return
+            sk = getattr(self, "skeleton", None)
+            if sk is None:
+                QMessageBox.information(self, "Deviser", "Load a part (or sketch one) first.")
+                return
+            p, _ = QFileDialog.getSaveFileName(
+                self, "Save Deviser drawing", "part.devd", "Deviser drawing (*.devd)")
+            if not p:
+                return
+            try:
+                sk = copy.deepcopy(sk)
+                title = None
+                if getattr(self, "summary", None):
+                    title = self.summary.get("part_title")
+                elif getattr(self, "devp_doc", None):
+                    title = (self.devp_doc.get("part") or {}).get("title")
+                doc = ipt2devd_mod.make_devd({"skeleton": sk, "part": {"title": title or "Deviser part"}},
+                                              title=title)
+                size = ipt2devd_mod.save_devd(doc, p)
+                svg = os.path.splitext(p)[0] + ".svg"
+                ipt2devd_mod.devd_to_svg(doc, svg)
+                views = ", ".join(v["name"] for v in doc["views"])
+                QMessageBox.information(
+                    self, "Deviser",
+                    f"Saved:\n{p} ({size} bytes, views: {views})\n"
+                    f"Rendered:\n{svg}")
+            except Exception as e:
+                QMessageBox.critical(self, "Deviser", f"Cannot save .devd:\n{e}")
+
+        def save_explosion(self):
+            """Session 19: .devx exploded presentation from the loaded assembly."""
+            if ipt2devx_mod is None:
+                QMessageBox.warning(self, "Deviser", ".devx module unavailable")
+                return
+            if not (getattr(self, "ipt", None) and self.ipt.path.lower().endswith(".iam")):
+                QMessageBox.information(self, "Deviser", "Open an .iam assembly first.")
+                return
+            p, _ = QFileDialog.getSaveFileName(
+                self, "Save Deviser explosion", os.path.splitext(self.ipt.path)[0] + ".devx",
+                "Deviser presentation (*.devx)")
+            if not p:
+                return
+            try:
+                doc = ipt2devx_mod.make_devx(self.ipt.path)
+                size = ipt2devx_mod.save_devx(doc, p)
+                n = len(doc["occurrences"])
+                QMessageBox.information(
+                    self, "Deviser",
+                    f"Saved:\n{p} ({size} bytes, {n} occurrences, "
+                    f"axis {doc['presentation']['axis']}, "
+                    f"step {doc['presentation']['step_mm']} mm)")
+            except Exception as e:
+                QMessageBox.critical(self, "Deviser", f"Cannot save .devx:\n{e}")
 
         def export_json(self):
             if not self._loaded():

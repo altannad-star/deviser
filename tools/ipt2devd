@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""devd — Deviser native drawing format (.devd) reader/writer.
+
+Format design (session 19, mirrors .devp/.deva):
+  .devd = MAGIC "DEVD" + u16 version + zstd(level 19)(JSON):
+  {
+    "format": "devd",
+    "version": 1,
+    "units": "mm",
+    "drawing": {"title": "...", "author": "...", "scale": "1:1",
+                "sheet": "A4", "projection": "third-angle"},
+    "part_ref": "part.devp",        # referenced part (or source file)
+    "views": [
+      {"name": "Front", "origin_mm": [x, y],      # sheet position
+       "outline": [[x,y], ...],                   # polygon (mm, sheet space)
+       "circles": [{"center_mm": [x,y], "r_mm": r}],
+       "dims": [{"type": "linear", "from": [x,y], "to": [x,y],
+                 "offset_mm": o, "text": "20"}]}
+    ],
+    "title_block": {...},
+    "provenance": {"source": "devp"|"ipt", "original_file": "..."}
+  }
+
+Views are derived by orthographic projection of the part skeleton:
+  Front  = sketch plane (X-Y) outline at depth 0
+  Top    = sketch outline extruded: X vs depth (X-Z)
+  Right  = Y vs depth (Z-Y)
+Cylinders project as circles (front) and rectangles (top/right).
+Holes project as circles in all views. Clean-room by construction.
+"""
+import json
+import struct
+import sys
+import os
+
+MAGIC = b"DEVD"
+VERSION = 1
+
+try:
+    import zstandard as zstd
+except ImportError:
+    sys.stderr.write("devd format requires: pip install zstandard\n")
+    sys.exit(2)
+
+import importlib.util
+import importlib.machinery
+
+
+def _load(name, target):
+    here = os.path.dirname(os.path.abspath(__file__))
+    for p in (os.path.join(here, name),
+              os.path.join(getattr(sys, "_MEIPASS", here), name)):
+        if os.path.exists(p):
+            loader = importlib.machinery.SourceFileLoader(target, p)
+            spec = importlib.util.spec_from_loader(target, loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            return mod
+    raise RuntimeError(f"module {name} not found")
+
+
+iptinfo = _load("iptinfo", "iptinfo")
+ipt2obj = _load("ipt2obj", "ipt2obj_mod")
+
+
+def _bbox(verts):
+    xs = [v[0] for v in verts]
+    ys = [v[1] for v in verts]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def make_views(sk, scale=1.0):
+    """Orthographic views (mm) from a skeleton dict (cm coords inside sk).
+
+    Returns a list of view dicts; positions are un-laid-out (origins [0,0])
+    until layout_views() places them on the sheet.
+    """
+    S = 10.0  # cm -> mm
+    depth_mm = sk["depth_cm"] * S
+    holes = sk.get("holes", [])
+    views = []
+
+    if sk["type"] == "cylinder":
+        cx, cy = sk["center_cm"][0] * S, sk["center_cm"][1] * S
+        r = sk["radius_cm"] * S
+        d = r * 2
+        # Front: circle
+        views.append({
+            "name": "Front",
+            "outline": [],
+            "circles": [{"center_mm": [cx, cy], "r_mm": r}],
+            "dims": [{"type": "linear", "from": [cx - r, cy],
+                      "to": [cx + r, cy], "offset_mm": -r * 0.4,
+                      "text": f"{d:.4g}"}],
+            "extent_mm": [d, d],
+        })
+        # Top: rectangle width x depth
+        views.append({
+            "name": "Top",
+            "outline": [[cx - r, 0], [cx + r, 0], [cx + r, depth_mm],
+                        [cx - r, depth_mm]],
+            "circles": [],
+            "dims": [{"type": "linear", "from": [cx - r, 0],
+                      "to": [cx + r, 0], "offset_mm": -6, "text": f"{d:.4g}"},
+                     {"type": "linear", "from": [cx + r, 0],
+                      "to": [cx + r, depth_mm], "offset_mm": 8,
+                      "text": f"{depth_mm:.4g}"}],
+            "extent_mm": [d, depth_mm],
+        })
+        # Right: depth x diameter
+        views.append({
+            "name": "Right",
+            "outline": [[0, cy - r], [depth_mm, cy - r],
+                        [depth_mm, cy + r], [0, cy + r]],
+            "circles": [],
+            "dims": [{"type": "linear", "from": [0, cy - r],
+                      "to": [depth_mm, cy - r], "offset_mm": -6,
+                      "text": f"{depth_mm:.4g}"}],
+            "extent_mm": [depth_mm, d],
+        })
+    else:
+        verts = [(v[0] * S, v[1] * S) for v in sk["verts_cm"]]
+        x0, y0, x1, y1 = _bbox(verts)
+        w, h = x1 - x0, y1 - y0
+        # Front: the sketch polygon
+        front_circles = []
+        for hole in holes:
+            c = hole.get("center_mm")
+            if c:
+                front_circles.append({"center_mm": [c[0], c[1]],
+                                      "r_mm": hole["r_mm"]})
+        views.append({
+            "name": "Front",
+            "outline": [list(v) for v in verts],
+            "circles": front_circles,
+            "dims": [{"type": "linear", "from": [x0, y0], "to": [x1, y0],
+                      "offset_mm": -6, "text": f"{w:.4g}"},
+                     {"type": "linear", "from": [x1, y0], "to": [x1, y1],
+                      "offset_mm": 8, "text": f"{h:.4g}"}],
+            "extent_mm": [w, h],
+        })
+        # Top: X vs depth
+        views.append({
+            "name": "Top",
+            "outline": [[x0, 0], [x1, 0], [x1, depth_mm], [x0, depth_mm]],
+            "circles": [{"center_mm": [hh["center_mm"][0], depth_mm / 2],
+                         "r_mm": hh["r_mm"]}
+                        for hh in holes if hh.get("center_mm")],
+            "dims": [{"type": "linear", "from": [x0, depth_mm],
+                      "to": [x1, depth_mm], "offset_mm": 8,
+                      "text": f"{w:.4g}"},
+                     {"type": "linear", "from": [x1, 0], "to": [x1, depth_mm],
+                      "offset_mm": 8, "text": f"{depth_mm:.4g}"}],
+            "extent_mm": [w, depth_mm],
+        })
+        # Right: depth vs Y
+        views.append({
+            "name": "Right",
+            "outline": [[0, y0], [depth_mm, y0], [depth_mm, y1], [0, y1]],
+            "circles": [],
+            "dims": [{"type": "linear", "from": [0, y1], "to": [depth_mm, y1],
+                      "offset_mm": -6, "text": f"{depth_mm:.4g}"},
+                     {"type": "linear", "from": [depth_mm, y0],
+                      "to": [depth_mm, y1], "offset_mm": 8,
+                      "text": f"{h:.4g}"}],
+            "extent_mm": [depth_mm, h],
+        })
+    if sk.get("fillet_r_mm"):
+        for v in views:
+            v.setdefault("notes", []).append(
+                f"R{sk['fillet_r_mm']:g} fillet")
+    return views
+
+
+def layout_views(views, sheet=(210.0, 297.0), margin=18.0, gap=14.0):
+    """Third-angle layout: Top above Front, Right right of Front.
+    Mutates each view's 'origin_mm'."""
+    by_name = {v["name"]: v for v in views}
+    front = by_name.get("Front")
+    top = by_name.get("Top")
+    right = by_name.get("Right")
+    sw, sh = sheet
+    center_x = sw / 2
+
+    # front: bottom-middle area
+    if front:
+        w, h = front["extent_mm"]
+        front["origin_mm"] = [center_x - w / 2, margin + 60 + h]
+    if top and front:
+        w, _ = top["extent_mm"]
+        _, fh = front["extent_mm"]
+        top["origin_mm"] = [front["origin_mm"][0] + (front["extent_mm"][0] - w) / 2,
+                            front["origin_mm"][1] + fh + gap]
+    if right and front:
+        w, h = right["extent_mm"]
+        right["origin_mm"] = [front["origin_mm"][0] + front["extent_mm"][0] + gap,
+                              front["origin_mm"][1] + (front["extent_mm"][1] - h) / 2]
+    return views
+
+
+def make_devd(part_source, title=None, author=None):
+    """Build a .devd document from a .devp document, a skeleton dict,
+    or an .ipt path (skeleton extracted)."""
+    sk = None
+    prov_source = "devp"
+    orig = os.path.basename(part_source) if isinstance(part_source, str) else "part"
+    if isinstance(part_source, dict):
+        sk = part_source.get("skeleton")
+        title = title or (part_source.get("part") or {}).get("title")
+        author = author or (part_source.get("part") or {}).get("author")
+    elif isinstance(part_source, str) and part_source.lower().endswith(".devp"):
+        ipt2devp = _load("ipt2devp", "ipt2devp_mod")
+        doc = ipt2devp.load_devp(part_source)
+        sk = doc.get("skeleton")
+        title = title or (doc.get("part") or {}).get("title")
+        author = author or (doc.get("part") or {}).get("author")
+        prov_source = "devp"
+    elif isinstance(part_source, str):
+        with iptinfo.IptFile(part_source) as ipt:
+            ipt2devp = _load("ipt2devp", "ipt2devp_mod")
+            sk, _ = ipt2devp.skeleton_from_ipt(ipt)
+            title = title or ipt.part_title()
+            author = author or ipt.author()
+            prov_source = "ipt"
+    if not sk:
+        raise ValueError("no skeleton could be derived from the part")
+
+    views = layout_views(make_views(sk))
+    doc = {
+        "format": "devd",
+        "version": VERSION,
+        "units": "mm",
+        "drawing": {
+            "title": title or "Deviser part",
+            "author": author or "",
+            "scale": "1:1",
+            "sheet": "A4",
+            "projection": "third-angle",
+        },
+        "part_ref": orig,
+        "views": views,
+        "provenance": {"source": prov_source, "original_file": orig},
+    }
+    return doc
+
+
+def save_devd(doc, path):
+    payload = json.dumps(doc, indent=1, default=str).encode()
+    packed = zstd.ZstdCompressor(level=19).compress(payload)
+    with open(path, "wb") as f:
+        f.write(MAGIC)
+        f.write(struct.pack("<H", doc.get("version", VERSION)))
+        f.write(packed)
+    return os.path.getsize(path)
+
+
+def load_devd(path):
+    with open(path, "rb") as f:
+        head = f.read(6)
+        if len(head) < 6 or head[:4] != MAGIC:
+            raise ValueError("not a .devd file (bad magic)")
+        ver = struct.unpack_from("<H", head, 4)[0]
+        if ver > VERSION:
+            raise ValueError(f"devd v{ver} newer than supported v{VERSION}")
+        packed = f.read()
+    payload = zstd.ZstdDecompressor().decompress(packed, max_output_size=10_000_000)
+    doc = json.loads(payload.decode())
+    if doc.get("format") != "devd":
+        raise ValueError("devd doc missing format tag")
+    return doc
+
+
+def devd_to_svg(doc, path):
+    """Render the drawing to an A4 SVG sheet."""
+    W, H = 210, 297
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" '
+           f'width="{W}mm" height="{H}mm" viewBox="0 0 {W} {H}">',
+           '<rect width="100%" height="100%" fill="white"/>',
+           '<g stroke="black" fill="none" stroke-width="0.35">',
+           f'<rect x="8" y="{H-38}" width="{W-16}" height="30"/>',
+           f'<line x1="8" y1="{H-23}" x2="{W-8}" y2="{H-23}"/>',
+           f'<line x1="{W/2+30}" y1="{H-38}" x2="{W/2+30}" y2="{H-8}"/>',
+           '</g>']
+    d = doc["drawing"]
+    out.append(f'<text x="12" y="{H-27}" font-size="5" font-family="sans-serif">'
+               f'Title: {d["title"]}</text>')
+    out.append(f'<text x="12" y="{H-16}" font-size="4" font-family="sans-serif">'
+               f'Author: {d.get("author") or "-"}   Scale: {d["scale"]}   '
+               f'Sheet: {d["sheet"]}   Projection: {d["projection"]}</text>')
+    out.append(f'<text x="{W/2+34}" y="{H-27}" font-size="4" font-family="sans-serif">'
+               f'Part: {doc.get("part_ref")}</text>')
+    out.append('<g stroke="black" fill="none" stroke-width="0.35">')
+    for v in doc.get("views", []):
+        ox, oy = v.get("origin_mm", [0, 0])
+        pts = v.get("outline") or []
+        if pts:
+            xy = " ".join(f"{ox + p[0]:.3f},{H - (oy + p[1]):.3f}" for p in pts)
+            out.append(f'<polygon points="{xy}"/>')
+        for c in v.get("circles", []):
+            cc = c["center_mm"]
+            out.append(f'<circle cx="{ox + cc[0]:.3f}" '
+                       f'cy="{H - (oy + cc[1]):.3f}" r="{c["r_mm"]:.3f}"/>')
+    out.append('</g>')
+    out.append('<g font-size="3.4" font-family="sans-serif" fill="black">')
+    for v in doc.get("views", []):
+        ox, oy = v.get("origin_mm", [0, 0])
+        out.append(f'<text x="{ox}" y="{H - oy + 8}" '
+                   f'font-size="4" font-weight="bold">{v["name"]}</text>')
+        for dim in v.get("dims", []):
+            x1, y1 = dim["from"]
+            x2, y2 = dim["to"]
+            off = dim.get("offset_mm", 6)
+            # dimension line offset perpendicular to the measure direction
+            if abs(y1 - y2) < 1e-9:      # horizontal measure
+                yy = H - (oy + y1 + off)
+                out.append(f'<line x1="{ox+x1}" y1="{yy}" x2="{ox+x2}" y2="{yy}" '
+                           f'stroke="black" stroke-width="0.25"/>')
+                out.append(f'<text x="{ox + (x1+x2)/2 - 4}" y="{yy - 1}" >'
+                           f'{dim.get("text","")}</text>')
+            else:                        # vertical measure
+                xx = ox + x2 + off
+                out.append(f'<line x1="{xx}" y1="{H - (oy + y1)}" x2="{xx}" '
+                           f'y2="{H - (oy + y2)}" stroke="black" stroke-width="0.25"/>')
+                out.append(f'<text x="{xx + 1}" y="{H - (oy + (y1+y2)/2)}">'
+                           f'{dim.get("text","")}</text>')
+        for note in v.get("notes", []):
+            out.append(f'<text x="{ox}" y="{H - oy - 3}" font-style="italic">'
+                       f'{note}</text>')
+    out.append('</g></svg>')
+    with open(path, "w") as f:
+        f.write("\n".join(out))
+    return os.path.getsize(path)
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(description="Deviser .devd drawing format tool")
+    ap.add_argument("part", help="input: .ipt, .devp, or nothing (use --skeleton-json)")
+    ap.add_argument("-o", "--output", help="output .devd path")
+    ap.add_argument("--svg", help="also render an SVG sheet")
+    ap.add_argument("--round-trip", action="store_true",
+                    help="verify save->load round-trip equality")
+    args = ap.parse_args()
+
+    out = args.output or (args.part.rsplit(".", 1)[0] + ".devd")
+    doc = make_devd(args.part)
+    size = save_devd(doc, out)
+    views = ", ".join(f"{v['name']}" for v in doc["views"])
+    print(f"wrote {out} ({size} bytes, devd v{VERSION}; views: {views})")
+    if args.svg:
+        sp = args.svg
+        sz = devd_to_svg(doc, sp)
+        print(f"rendered {sp} ({sz} bytes)")
+    if args.round_trip:
+        doc2 = load_devd(out)
+        assert doc == doc2, "round-trip mismatch"
+        print("round-trip OK")
+
+
+if __name__ == "__main__":
+    main()

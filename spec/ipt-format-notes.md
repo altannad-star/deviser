@@ -761,6 +761,35 @@ Verified headless (offscreen Qt):
 AppImage: Deviser-E5-1.7-x86_64.AppImage
   (md5 9c170a8d6a0acc20cdc95595660ebeee, 62 MB)
 
+## 7z. Session 19 — .devd DRAWINGS + .devx PRESENTATIONS SHIPPED
+
+The last two Deviser-native formats, closing the .devp/.deva/.devd/.devx
+square (all Deviser-side; no new Inventor decoding needed):
+
+.devd (Deviser Drawing) — tools/ipt2devd:
+  MAGIC "DEVD" + u16 v + zstd(JSON): drawing header (title/author/scale/
+  sheet A4/third-angle), part_ref, views[] — orthographic projections of
+  the part skeleton: Front (sketch plane), Top (X vs depth), Right
+  (depth vs Y); each view carries outline/circles + linear dims.
+  - third-angle sheet layout: Top above Front, Right to the right
+  - devd_to_svg(): A4 sheet with title block, geometry, dimension lines
+  - verified: D cube -> 3 views 10x10, dims 10/10/10 exact; cyl/hole/
+    chamfer all project correctly; round-trips byte-equal
+  - GUI: "Drawing…" button (any loaded/sketched part -> .devd + .svg)
+
+.devx (Deviser eXploded presentation) — tools/ipt2devx:
+  MAGIC "DEVX" + u16 v + zstd(JSON): presentation header (style/axis/
+  step_mm), assembly_ref, occurrences[] with assembled transform +
+  explode_mm offset, tweaks[] for manual overrides.
+  - default linear explosion: occurrence i moves i*step along axis
+    (base stays); explode applied to the transform translation column
+  - verified on assembly.iam: 2 occurrences, Cyl:1 +30mm Z; round-trip
+  - GUI: "Explosion…" button (loaded .iam -> .devx)
+
+AppImage: Deviser-D4-1.8-x86_64.AppImage
+  (md5 d490cf373efddcfbc07863866a698bd9, 62 MB) — all four formats
+  plus sketch editor, parameter editor, feature replay, assembly view.
+
 ## 8. Open questions / next probes
 1. Parameter record full grammar: unit token, parameter type/flags,
   tolerance fields, multi-parameter files (B2c with 3 params?)

@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""devx — Deviser native presentation format (.devx) reader/writer.
+
+Format design (session 19, mirrors .devp/.deva/.devd):
+  .devx = MAGIC "DEVX" + u16 version + zstd(level 19)(JSON):
+  {
+    "format": "devx",
+    "version": 1,
+    "units": "mm",
+    "presentation": {"title": "...", "author": "...", "style": "exploded"},
+    "assembly_ref": "assembly.deva",
+    "occurrences": [
+      {"name": "Cyl:1", "part": "Cyl", "transform": [...],   # assembled pos
+       "explode_mm": [dx, dy, dz]}                            # explosion offset
+    ],
+    "tweaks": [...]        # manual overrides, applied on top
+    "provenance": {"source": "iam"|"deva", "original_file": "..."}
+  }
+
+Default explosion: each occurrence is offset along +Z proportional to its
+index (a linear 'pull-apart' along the assembly axis), on top of its
+assembled transform. Clean-room by construction.
+"""
+import json
+import struct
+import sys
+import os
+
+MAGIC = b"DEVX"
+VERSION = 1
+
+try:
+    import zstandard as zstd
+except ImportError:
+    sys.stderr.write("devx format requires: pip install zstandard\n")
+    sys.exit(2)
+
+import importlib.util
+import importlib.machinery
+
+
+def _load(name, target):
+    here = os.path.dirname(os.path.abspath(__file__))
+    for p in (os.path.join(here, name),
+              os.path.join(getattr(sys, "_MEIPASS", here), name)):
+        if os.path.exists(p):
+            loader = importlib.machinery.SourceFileLoader(target, p)
+            spec = importlib.util.spec_from_loader(target, loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            return mod
+    raise RuntimeError(f"module {name} not found")
+
+
+ipt2deva = _load("ipt2deva", "ipt2deva_mod")
+
+
+def make_devx(source, step_mm=30.0, axis="Z"):
+    """Build a .devx document from a .deva file or an .iam path.
+
+    Default linear explosion: occurrence i moves i * step_mm along `axis`
+    (skipping the base, index 0, which stays put).
+    """
+    if isinstance(source, str) and source.lower().endswith(".deva"):
+        doc_a = ipt2deva.load_deva(source)
+        prov = "deva"
+        orig = os.path.basename(source)
+        title = (doc_a.get("assembly") or {}).get("title") or "Deviser assembly"
+        author = (doc_a.get("assembly") or {}).get("author")
+        occs = doc_a.get("occurrences") or []
+        assembly_ref = orig
+    elif isinstance(source, str):
+        doc_a = ipt2deva.make_deva(source)
+        prov = "iam"
+        orig = os.path.basename(source)
+        title = (doc_a.get("assembly") or {}).get("title") or "Deviser assembly"
+        author = (doc_a.get("assembly") or {}).get("author")
+        occs = doc_a.get("occurrences") or []
+        assembly_ref = orig
+    else:
+        raise ValueError("source must be a .deva or .iam path")
+
+    axis_idx = {"X": 0, "Y": 1, "Z": 2}[axis.upper()]
+    out_occs = []
+    for i, o in enumerate(occs):
+        off = [0.0, 0.0, 0.0]
+        if i > 0:
+            off[axis_idx] = float(i * step_mm)
+        out_occs.append({
+            "name": o["name"],
+            "part": o.get("part"),
+            "transform": o.get("transform"),
+            "explode_mm": off,
+        })
+
+    doc = {
+        "format": "devx",
+        "version": VERSION,
+        "units": "mm",
+        "presentation": {
+            "title": title,
+            "author": author,
+            "style": "exploded",
+            "axis": axis.upper(),
+            "step_mm": step_mm,
+        },
+        "assembly_ref": assembly_ref,
+        "occurrences": out_occs,
+        "tweaks": [],
+        "provenance": {"source": prov, "original_file": orig},
+    }
+    return doc
+
+
+def save_devx(doc, path):
+    payload = json.dumps(doc, indent=1, default=str).encode()
+    packed = zstd.ZstdCompressor(level=19).compress(payload)
+    with open(path, "wb") as f:
+        f.write(MAGIC)
+        f.write(struct.pack("<H", doc.get("version", VERSION)))
+        f.write(packed)
+    return os.path.getsize(path)
+
+
+def load_devx(path):
+    with open(path, "rb") as f:
+        head = f.read(6)
+        if len(head) < 6 or head[:4] != MAGIC:
+            raise ValueError("not a .devx file (bad magic)")
+        ver = struct.unpack_from("<H", head, 4)[0]
+        if ver > VERSION:
+            raise ValueError(f"devx v{ver} newer than supported v{VERSION}")
+        packed = f.read()
+    payload = zstd.ZstdDecompressor().decompress(packed, max_output_size=10_000_000)
+    doc = json.loads(payload.decode())
+    if doc.get("format") != "devx":
+        raise ValueError("devx doc missing format tag")
+    return doc
+
+
+def exploded_transform(transform, explode_mm):
+    """Apply an explode offset to a raw 12-double transform (row-major 3x4:
+    rows [r0 r1 r2] of 4). Translation lives in the 4th column."""
+    if not transform or len(transform) < 12:
+        return transform
+    t = list(transform)
+    t[3] += explode_mm[0] / 10.0     # cm internal (matches .deva raw)
+    t[7] += explode_mm[1] / 10.0
+    t[11] += explode_mm[2] / 10.0
+    return t
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(description="Deviser .devx presentation format tool")
+    ap.add_argument("source", help="input .iam or .deva")
+    ap.add_argument("-o", "--output", help="output .devx path")
+    ap.add_argument("--step", type=float, default=30.0,
+                    help="explosion step per occurrence (mm, default 30)")
+    ap.add_argument("--axis", default="Z", choices=["X", "Y", "Z"],
+                    help="explosion axis (default Z)")
+    ap.add_argument("--round-trip", action="store_true",
+                    help="verify save->load round-trip equality")
+    args = ap.parse_args()
+
+    out = args.output or (args.source.rsplit(".", 1)[0] + ".devx")
+    doc = make_devx(args.source, step_mm=args.step, axis=args.axis)
+    size = save_devx(doc, out)
+    n = len(doc["occurrences"])
+    print(f"wrote {out} ({size} bytes, devx v{VERSION}; {n} occurrences, "
+          f"axis {args.axis}, step {args.step} mm)")
+    if args.round_trip:
+        doc2 = load_devx(out)
+        assert doc == doc2, "round-trip mismatch"
+        print("round-trip OK")
+
+
+if __name__ == "__main__":
+    main()
