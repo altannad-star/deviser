@@ -95,7 +95,23 @@ def extract_skeleton(ipt):
 
 def apply_edit(sk, param_name, new_value_cm):
     sk = copy.deepcopy(sk)
-    if sk["type"] == "cylinder" and param_name == "d0":
+    # E4: skeleton-native names (new parts)
+    if param_name == "w_cm" and sk["type"] == "prism":
+        w_old = max(max(v[0] for v in sk["verts_cm"]), 0.001)
+        scale = new_value_cm / w_old
+        sk["verts_cm"] = [(v[0]*scale, v[1]) for v in sk["verts_cm"]]
+    elif param_name == "h_cm" and sk["type"] == "prism":
+        h_old = max(max(v[1] for v in sk["verts_cm"]), 0.001)
+        scale = new_value_cm / h_old
+        sk["verts_cm"] = [(v[0], v[1]*scale) for v in sk["verts_cm"]]
+    elif param_name == "radius_cm" or (param_name == "w_cm" and sk["type"] == "cylinder"):
+        sk["radius_cm"] = new_value_cm
+    elif param_name == "depth_cm":
+        sk["depth_cm"] = new_value_cm
+    elif param_name == "fillet_r_mm":
+        sk["fillet_r_mm"] = new_value_cm
+    # E1: Inventor d-params
+    elif sk["type"] == "cylinder" and param_name == "d0":
         sk["radius_cm"] = new_value_cm / 2.0
     elif sk["type"] == "prism" and param_name in ("d0", "d1") and param_name != sk.get("depth_param"):
         old = max(max(v[0] for v in sk["verts_cm"]), max(v[1] for v in sk["verts_cm"]))
@@ -215,13 +231,14 @@ def run_qt():
             root = QVBoxLayout(central)
 
             top = QHBoxLayout()
+            btn_new = QPushButton("New Part…")
             btn_open = QPushButton("Open .ipt…")
             btn_open_devp = QPushButton("Open .devp…")
             btn_devp = QPushButton("Save .devp…")
             btn_obj = QPushButton("Export OBJ…")
             btn_step = QPushButton("Export STEP…")
             btn_json = QPushButton("Save JSON…")
-            for b in (btn_open, btn_open_devp, btn_devp, btn_obj, btn_step, btn_json):
+            for b in (btn_new, btn_open, btn_open_devp, btn_devp, btn_obj, btn_step, btn_json):
                 top.addWidget(b)
             lbl = QLabel("clean-room · no Autodesk code")
             top.addStretch()
@@ -264,6 +281,7 @@ def run_qt():
             ev.addWidget(self.edit_status)
             root.addWidget(edit_group)
 
+            btn_new.clicked.connect(self.new_part)
             btn_open.clicked.connect(self.open_file)
             btn_open_devp.clicked.connect(self.open_devp)
             btn_devp.clicked.connect(self.save_devp)
@@ -399,6 +417,64 @@ def run_qt():
                     self, "Deviser", f"Exported EDITED solid:\n{p}\nvolume {vol:.2f} mm³")
             except Exception as e:
                 QMessageBox.critical(self, "Deviser", f"Export failed:\n{e}")
+
+        def new_part(self):
+            """E4: create a Deviser part from scratch (no .ipt source)."""
+            from PySide6.QtWidgets import QDialog, QFormLayout, QDialogButtonBox, QComboBox
+            dlg = QDialog(self)
+            dlg.setWindowTitle("New Deviser Part")
+            form = QFormLayout(dlg)
+            shape = QComboBox()
+            shape.addItems(["Rectangle", "Circle"])
+            w = QDoubleSpinBox(); w.setDecimals(2); w.setRange(0.1, 1000); w.setValue(20.0)   # mm
+            h = QDoubleSpinBox(); h.setDecimals(2); h.setRange(0.1, 1000); h.setValue(15.0)   # mm
+            depth = QDoubleSpinBox(); depth.setDecimals(2); depth.setRange(0.1, 1000); depth.setValue(10.0)
+            fillet = QDoubleSpinBox(); fillet.setDecimals(2); fillet.setRange(0.0, 100); fillet.setValue(0.0)
+            form.addRow("Shape:", shape)
+            form.addRow("Width/Ø (mm):", w)
+            form.addRow("Height (mm):", h)
+            form.addRow("Extrude depth (mm):", depth)
+            form.addRow("Fillet r (mm, 0=none):", fillet)
+            buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            buttons.accepted.connect(dlg.accept)
+            buttons.rejected.connect(dlg.reject)
+            form.addRow(buttons)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            W, H, D, F = w.value()/10.0, h.value()/10.0, depth.value()/10.0, fillet.value()
+            if shape.currentText() == "Circle":
+                skeleton = {"type": "cylinder", "center_cm": [0,0], "radius_cm": W/2,
+                            "depth_cm": D, "fillet_r_mm": F, "chamfer_mm": 0, "holes": []}
+            else:
+                skeleton = {"type": "prism",
+                            "verts_cm": [[W,0],[W,H],[0,H],[0,0]],
+                            "depth_cm": D, "fillet_r_mm": F, "chamfer_mm": 0, "holes": []}
+            self.skeleton = skeleton
+            self.devp_doc = {
+                "format": "devp", "version": 1, "units": "mm",
+                "part": {"title": "Untitled", "author": "", "material": {}},
+                "parameters": {}, "skeleton": skeleton,
+                "history": [], "provenance": {"source": "deviser"},
+            }
+            self.ipt = None
+            self.summary = None
+            self.info.setPlainText(
+                f"New Deviser part\nShape: {skeleton['type']}\n"
+                f"Size: {w.value()} x {h.value()} mm, extrude {depth.value()} mm"
+                + (f", fillet {F} mm" if F else ""))
+            self.thumb.setText("(new part)")
+            # editor rows for the new part's key dims:
+            self.param_table.setRowCount(0)
+            for pname, pval in [("w_cm", W), ("h_cm", H), ("depth_cm", D), ("fillet_r_mm", F)]:
+                row = self.param_table.rowCount()
+                self.param_table.insertRow(row)
+                self.param_table.setItem(row, 0, QTableWidgetItem(pname))
+                sb = QDoubleSpinBox(); sb.setDecimals(4); sb.setRange(-1000, 1000); sb.setValue(pval)
+                self.param_table.setCellWidget(row, 1, sb)
+            self.btn_rebuild.setEnabled(True)
+            self.btn_step_edited.setEnabled(HAS_CQ)
+            self.btn_devp.setEnabled(True)
+            self.edit_status.setText("New part created — edit dims, rebuild, save .devp.")
 
         def open_devp(self):
             if ipt2devp_mod is None:

@@ -179,16 +179,20 @@ def devp_to_solid(doc):
     return skeleton_to_solid(sk)
 
 
-def skeleton_to_solid(sk):
+def _single_body_solid(sk):
+    """One skeleton body -> OCC workplane (no multi-body logic)."""
     import cadquery as cq
     S = 10.0
+    z_off = sk.get("z_offset_mm", 0.0)
     if sk["type"] == "cylinder":
         wp = (cq.Workplane("XY")
+              .workplane(offset=z_off)
               .center(sk["center_cm"][0]*S, sk["center_cm"][1]*S)
               .circle(sk["radius_cm"]*S)
               .extrude(sk["depth_cm"]*S))
     else:
         wp = (cq.Workplane("XY")
+              .workplane(offset=z_off)
               .polyline([(v[0]*S, v[1]*S) for v in sk["verts_cm"]])
               .close().extrude(sk["depth_cm"]*S))
     if sk.get("fillet_r_mm", 0) > 0:
@@ -201,6 +205,33 @@ def skeleton_to_solid(sk):
             .center(c[0], c[1]) \
             .hole(hole["r_mm"]*2)
     return wp
+
+
+def skeleton_to_solid(sk):
+    """Multi-body skeleton -> OCC workplane.
+
+    Skeleton may contain 'bodies': [{...skeleton fields..., 'op': 'add'|'cut',
+    'z_offset_mm': z}]. First body is the base; subsequent bodies are
+    unioned (add) or cut (cut). Falls back to single-body for old skeletons.
+    """
+    bodies = sk.get("bodies")
+    if not bodies:
+        return _single_body_solid(sk)
+    base = None
+    for b in bodies:
+        b.setdefault("z_offset_mm", 0.0)
+        wp = _single_body_solid(b)
+        if base is None:
+            base = wp
+        else:
+            op = b.get("op", "add")
+            if op == "cut":
+                base = base.cut(wp)
+            elif op == "intersect":
+                base = base.intersect(wp)
+            else:
+                base = base.union(wp)
+    return base
 
 
 def main():
